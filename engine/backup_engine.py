@@ -33,7 +33,7 @@ def _cleanup_old_versions(archive_dir, stem, max_versions):
     max_versions = max(1, max_versions)
     pattern = re.compile(rf"^{re.escape(stem)}_\d{{8}}_\d{{6}}_[0-9a-f]{{16}}\.7z$")
     versions = sorted(
-        [p for p in archive_dir.glob(f"{stem}_*.7z") if pattern.match(p.name)],
+        [p for p in archive_dir.glob("*.7z") if pattern.match(p.name)],
         key=lambda p: p.name,
     )
     while len(versions) > max_versions:

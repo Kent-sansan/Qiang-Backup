@@ -35,7 +35,7 @@ def find_restorable_files(source_folders, backup_root, extensions):
             )
 
             versions = []
-            for archive in backup_dir.glob(f"{safe_stem}_*.7z"):
+            for archive in backup_dir.glob("*.7z"):
                 m = pattern.match(archive.name)
                 if m:
                     versions.append({

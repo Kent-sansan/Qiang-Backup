@@ -81,7 +81,7 @@ def _find_latest_backup_hash(source_file, source_root, backup_root):
     latest_hash = None
     all_hashes = set()
 
-    for archive in backup_dir.glob(f"{safe_stem}_*.7z"):
+    for archive in backup_dir.glob("*.7z"):
         m = pattern.match(archive.name)
         if m:
             h = m.group(3)
