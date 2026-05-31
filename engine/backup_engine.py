@@ -8,7 +8,7 @@ from pathlib import Path
 
 import py7zr
 
-from engine.change_detector import safe_rglob, _compute_safe_stem
+from engine.change_detector import safe_rglob, _compute_safe_stem, _get_relative_mirror_dir
 from engine.backup_log import log_backup, log_error
 
 
@@ -71,7 +71,7 @@ def backup_single_file(source_file, source_root, backup_root, password, max_vers
     hash16 = full_hash[:16]
 
     archive_name = _make_archive_name(source_file, ts, hash16)
-    mirror_dir = str(rel.parent)
+    mirror_dir = _get_relative_mirror_dir(source_file, source_root)
     archive_path = backup_root / mirror_dir / archive_name
     archive_path_tmp = None
 

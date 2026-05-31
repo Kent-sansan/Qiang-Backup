@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QPushButton, QLineEdit, QListWidget, QTextEdit, QPlainTextEdit,
     QLabel, QSpinBox, QCheckBox, QFileDialog, QMessageBox,
     QProgressDialog, QStatusBar, QSystemTrayIcon, QDialog,
-    QApplication,
+    QApplication, QProgressBar,
 )
 from PySide6.QtCore import Qt, QThreadPool, Signal, QObject, QRunnable, QMutex
 from PySide6.QtGui import QFont, QCloseEvent, QIcon
@@ -59,11 +59,15 @@ class ScanWorker(QRunnable):
         start = time.monotonic()
 
         def on_file(f):
+            if self._cancelled:
+                return False
             file_counter[0] += 1
             if file_counter[0] % 5 == 0:
                 self.signals.file_count.emit(file_counter[0])
+            return True
 
         try:
+            self.signals.file_count.emit(0)
             for folder in self.source_folders:
                 if self._cancelled:
                     break
@@ -118,6 +122,7 @@ class BackupWorker(QRunnable):
 
 class OrphanScanSignals(QObject):
     result = Signal(object)
+    file_count = Signal(int)
 
 
 class OrphanScanWorker(QRunnable):
@@ -134,8 +139,15 @@ class OrphanScanWorker(QRunnable):
 
     def run(self):
         try:
+            def on_progress(count):
+                if self._cancelled:
+                    return False
+                self.signals.file_count.emit(count)
+                return True
+
             orphans = find_orphaned_backups(
-                self.source_folders, self.backup_root, self.extensions
+                self.source_folders, self.backup_root, self.extensions,
+                progress_cb=on_progress,
             )
         except Exception:
             orphans = []
@@ -145,6 +157,7 @@ class OrphanScanWorker(QRunnable):
 
 class RestoreScanSignals(QObject):
     result = Signal(object, object)
+    file_count = Signal(int)
 
 
 class RestoreScanWorker(QRunnable):
@@ -154,15 +167,27 @@ class RestoreScanWorker(QRunnable):
         self.backup_root = backup_root
         self.extensions = extensions
         self.signals = signals
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
 
     def run(self):
         try:
+            def on_progress(count):
+                if self._cancelled:
+                    return False
+                self.signals.file_count.emit(count)
+                return True
+
             restorable, unmatched = find_restorable_files(
-                self.source_folders, self.backup_root, self.extensions
+                self.source_folders, self.backup_root, self.extensions,
+                progress_cb=on_progress,
             )
-            self.signals.result.emit(restorable, unmatched)
         except Exception:
-            self.signals.result.emit([], [])
+            restorable, unmatched = [], []
+        if not self._cancelled:
+            self.signals.result.emit(restorable, unmatched)
 
 
 class RestoreTaskSignals(QObject):
@@ -197,6 +222,7 @@ class RestoreTaskWorker(QRunnable):
 
 class IntegrityScanSignals(QObject):
     result = Signal(object)
+    progress = Signal(int, int, str)
 
 
 class IntegrityScanWorker(QRunnable):
@@ -213,8 +239,15 @@ class IntegrityScanWorker(QRunnable):
 
     def run(self):
         try:
+            def on_progress(current, total, fname):
+                if self._cancelled:
+                    return False
+                self.signals.progress.emit(current, total, fname)
+                return True
+
             corrupted = check_backup_integrity(
-                self.backup_root, self.extensions, self.password
+                self.backup_root, self.extensions, self.password,
+                progress_cb=on_progress,
             )
         except Exception:
             corrupted = []
@@ -539,20 +572,14 @@ class MainWindow(QMainWindow):
 
         self._manual_scan_running = True
 
-        progress = QProgressDialog("正在扫描文件变更...", "取消", 0, 0, self)
-        progress.setWindowTitle("扫描中")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.resize(440, 120)
-        self._center_progress(progress)
-        progress.show()
+        progress, label = self._create_progress("手动备份 — 扫描中", "已扫描 0 个文件...")
 
         scan_signals = ScanSignals()
         worker = ScanWorker(valid_folders, cfg["backup_root"], cfg["extensions"], scan_signals)
         worker_holder = [worker]
 
-        def on_progress(msg):
-            progress.setLabelText(msg)
+        def on_file_count(count):
+            label.setText(f"已扫描 {count} 个文件...")
 
         def on_finished(results, _elapsed):
             progress.close()
@@ -563,9 +590,9 @@ class MainWindow(QMainWindow):
             worker_holder[0].cancel()
             self._manual_scan_running = False
 
-        scan_signals.progress.connect(on_progress)
+        scan_signals.file_count.connect(on_file_count)
         scan_signals.finished.connect(on_finished)
-        progress.canceled.connect(on_cancelled)
+        progress.rejected.connect(on_cancelled)
         self._threadpool.start(worker)
 
     def _process_scan_results(self, cfg, results):
@@ -637,16 +664,24 @@ class MainWindow(QMainWindow):
 
         self._restore_scan_running = True
 
-        progress = QProgressDialog("正在扫描可恢复文件...", "", 0, 0, self)
-        progress.setWindowTitle("一键恢复")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.resize(400, 100)
-        self._center_progress(progress)
-        progress.show()
+        progress, label = self._create_progress("一键恢复", "已扫描 0 个文件...")
 
         scan_signals = RestoreScanSignals()
         scan_signals.result.connect(self._on_restore_scan_done)
+
+        def on_file_count(count):
+            label.setText(f"已扫描 {count} 个文件...")
+
+        def on_cancelled():
+            worker_holder[0].cancel()
+            self._restore_scan_running = False
+            try:
+                progress.close()
+            except Exception:
+                pass
+
+        scan_signals.file_count.connect(on_file_count)
+        progress.rejected.connect(on_cancelled)
 
         self._restore_progress = progress
         self._restore_cfg = {
@@ -654,9 +689,11 @@ class MainWindow(QMainWindow):
             "backup_root": cfg.get("backup_root", ""),
         }
 
-        self._threadpool.start(RestoreScanWorker(
+        worker = RestoreScanWorker(
             valid, cfg["backup_root"], cfg["extensions"], scan_signals
-        ))
+        )
+        worker_holder = [worker]
+        self._threadpool.start(worker)
 
     def _on_restore_scan_done(self, restorable, unmatched):
         self._restore_scan_running = False
@@ -798,18 +835,15 @@ class MainWindow(QMainWindow):
 
         self._orphan_scan_running = True
 
-        progress = QProgressDialog("正在扫描孤儿备份...", "取消", 0, 0, self)
-        progress.setWindowTitle("孤儿清理")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.resize(400, 100)
-        self._center_progress(progress)
-        progress.show()
+        progress, label = self._create_progress("孤儿清理", "已扫描 0 个文件...")
 
         orphan_signals = OrphanScanSignals()
         worker = OrphanScanWorker(
             valid, cfg["backup_root"], cfg["extensions"], orphan_signals
         )
+
+        def on_file_count(count):
+            label.setText(f"已扫描 {count} 个文件...")
 
         def on_cancelled():
             worker.cancel()
@@ -840,7 +874,8 @@ class MainWindow(QMainWindow):
             self._orphan_dialog = None
 
         orphan_signals.result.connect(on_done)
-        progress.canceled.connect(on_cancelled)
+        orphan_signals.file_count.connect(on_file_count)
+        progress.rejected.connect(on_cancelled)
         self._threadpool.start(worker)
 
     # --- Integrity check ---
@@ -859,19 +894,16 @@ class MainWindow(QMainWindow):
 
         self._integrity_scan_running = True
 
-        progress = QProgressDialog("正在检查备份完整性...", "取消", 0, 0, self)
-        progress.setWindowTitle("完整性检查")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.resize(400, 100)
-        self._center_progress(progress)
-        progress.show()
+        progress, label = self._create_progress("完整性检查", "已检查 0 个文件...")
 
         integrity_signals = IntegrityScanSignals()
         worker = IntegrityScanWorker(
             cfg["backup_root"], cfg["extensions"], cfg.get("password", ""),
             integrity_signals,
         )
+
+        def on_progress(current, total, fname):
+            label.setText(f"已检查 {current} 个文件...")
 
         def on_cancelled():
             worker.cancel()
@@ -908,8 +940,9 @@ class MainWindow(QMainWindow):
                     QMessageBox.information(self, "完成", f"已删除 {deleted} 个损坏文件。")
             self._integrity_dialog = None
 
+        integrity_signals.progress.connect(on_progress)
         integrity_signals.result.connect(on_done)
-        progress.canceled.connect(on_cancelled)
+        progress.rejected.connect(on_cancelled)
         self._threadpool.start(worker)
 
     # --- Config save ---
@@ -970,12 +1003,38 @@ class MainWindow(QMainWindow):
         self._log(f"{'✅ 已开启' if checked else '❌ 已关闭'}开机自启")
         self._autostart_syncing = False
 
-    def _center_progress(self, progress):
-        center = self.geometry().center()
-        progress.move(
-            center.x() - progress.width() // 2,
-            center.y() - progress.height() // 2,
+    def _create_progress(self, title, label_text, cancel_text="取消"):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setFixedSize(440, 120)
+        dlg.setWindowFlags(dlg.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(20, 12, 20, 12)
+
+        lbl = QLabel(label_text)
+        lbl.setAlignment(Qt.AlignCenter)
+        layout.addWidget(lbl)
+
+        bar = QProgressBar()
+        bar.setRange(0, 0)
+        bar.setTextVisible(False)
+        bar.setFixedHeight(16)
+        layout.addWidget(bar)
+
+        btn = QPushButton(cancel_text)
+        btn.clicked.connect(dlg.reject)
+        layout.addWidget(btn, alignment=Qt.AlignCenter)
+
+        screen = QApplication.primaryScreen().geometry()
+        dlg.move(
+            (screen.width() - dlg.width()) // 2,
+            (screen.height() - dlg.height()) // 2,
         )
+        dlg.show()
+
+        return dlg, lbl
 
     def _log(self, msg):
         self._signals.log_signal.emit(msg)

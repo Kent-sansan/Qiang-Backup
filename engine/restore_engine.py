@@ -5,15 +5,19 @@ from pathlib import Path
 
 import py7zr
 
-from engine.change_detector import safe_rglob, _compute_safe_stem
+from engine.change_detector import safe_rglob, _compute_safe_stem, _get_relative_mirror_dir
 from engine.backup_log import log_restore, log_error
 
 
-def find_restorable_files(source_folders, backup_root, extensions):
-    """Scan source folders and backup directory, return (restorable_list, unmatched_list)."""
+def find_restorable_files(source_folders, backup_root, extensions, progress_cb=None):
+    """Scan source folders and backup directory, return (restorable_list, unmatched_list).
+    progress_cb(count) -> bool: return False to cancel."""
     backup_root = Path(backup_root)
     restorable = []
     unmatched = []
+    file_counter = 0
+    if progress_cb:
+        progress_cb(0)
 
     for folder in source_folders:
         source_root = Path(folder)
@@ -21,9 +25,12 @@ def find_restorable_files(source_folders, backup_root, extensions):
             continue
 
         for source_file in safe_rglob(source_root, extensions):
+            file_counter += 1
+            if progress_cb and file_counter % 5 == 0:
+                if not progress_cb(file_counter):
+                    return restorable, unmatched
             safe_stem = _compute_safe_stem(source_file.name)
-            rel = source_file.relative_to(source_root)
-            mirror_dir = str(rel.parent)
+            mirror_dir = _get_relative_mirror_dir(source_file, source_root)
             backup_dir = backup_root / mirror_dir
 
             if not backup_dir.exists():

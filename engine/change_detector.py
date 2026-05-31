@@ -47,12 +47,22 @@ def _compute_safe_stem(filename):
     return filename
 
 
+def _get_source_folder_name(source_root):
+    """Get display name for source folder: 'OneDrive' for D:\\OneDrive, 'D盘' for D:\\."""
+    source_root = Path(source_root)
+    if source_root.parent == source_root:
+        drive = source_root.drive
+        return drive[0] + '盘' if drive else source_root.name
+    return source_root.name
+
+
 def _get_relative_mirror_dir(source_file, source_root):
-    """Get the mirror directory path relative to source_root."""
+    """Get the mirror directory path relative to source_root, prefixed with source folder name."""
     source_file = Path(source_file)
     source_root = Path(source_root)
+    folder_name = _get_source_folder_name(source_root)
     rel = source_file.relative_to(source_root)
-    return str(rel.parent)
+    return str(Path(folder_name) / rel.parent)
 
 
 def _find_latest_backup_hash(source_file, source_root, backup_root):
@@ -123,8 +133,8 @@ def get_dirty_files(source_folder, backup_root, extensions, source_root=None, pr
         return dirty
 
     for f in safe_rglob(source_folder, extensions):
-        if progress_cb:
-            progress_cb(f)
+        if progress_cb and not progress_cb(f):
+            break
         latest_archive, backup_hash, all_hashes = _find_latest_backup_hash(f, source_root, backup_root)
 
         if latest_archive is None:

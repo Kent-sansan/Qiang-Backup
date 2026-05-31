@@ -8,6 +8,7 @@ from collections import defaultdict
 import py7zr
 
 from engine.backup_log import log_delete
+from engine.change_detector import _get_source_folder_name
 
 
 def _parse_backup_filename(basename, extensions):
@@ -51,8 +52,9 @@ def _filter_accessible_sources(source_folders):
     return [f for f in source_folders if Path(f).exists()]
 
 
-def find_orphaned_backups(source_folders, backup_root, extensions):
-    """Find backup archives whose source files no longer exist."""
+def find_orphaned_backups(source_folders, backup_root, extensions, progress_cb=None):
+    """Find backup archives whose source files no longer exist.
+    progress_cb(count) -> bool: return False to cancel."""
     accessible = _filter_accessible_sources(source_folders)
     if not accessible:
         return []
@@ -62,10 +64,19 @@ def find_orphaned_backups(source_folders, backup_root, extensions):
         return []
 
     orphan_map = defaultdict(list)
-    for archive_path, relative_parent, original_name, ts, _fh in entries:
+    for i, (archive_path, relative_parent, original_name, ts, _fh) in enumerate(entries, 1):
+        if progress_cb and i % 5 == 0:
+            if not progress_cb(i):
+                break
         found = False
         for src in accessible:
-            candidate = Path(src) / relative_parent / original_name
+            src_folder_name = _get_source_folder_name(src)
+            parts = Path(relative_parent).parts
+            if parts and parts[0] == src_folder_name:
+                inner = str(Path(*parts[1:])) if len(parts) > 1 else ''
+                candidate = Path(src) / inner / original_name
+            else:
+                candidate = Path(src) / relative_parent / original_name
             if candidate.exists():
                 found = True
                 break
@@ -85,8 +96,9 @@ def find_orphaned_backups(source_folders, backup_root, extensions):
     return result
 
 
-def check_backup_integrity(backup_root, extensions, password):
-    """Check all backup archives for corruption."""
+def check_backup_integrity(backup_root, extensions, password, progress_cb=None):
+    """Check all backup archives for corruption.
+    progress_cb(current, total, filename) -> bool: return False to cancel."""
     root = Path(backup_root)
     if not root.exists():
         return []
@@ -95,12 +107,17 @@ def check_backup_integrity(backup_root, extensions, password):
     if not entries:
         return []
 
+    total = len(entries)
     corrupted = []
     seen = set()
-    for archive_path, relative_parent, original_name, ts, _fh in entries:
+    if progress_cb:
+        progress_cb(0, total, "")
+    for i, (archive_path, relative_parent, original_name, ts, _fh) in enumerate(entries, 1):
         if archive_path in seen:
             continue
         seen.add(archive_path)
+        if progress_cb and i % 5 == 0 and not progress_cb(i, total, archive_path.name):
+            break
         ok = False
         for attempt in range(2):
             try:
