@@ -1,20 +1,27 @@
 """One-click restore dialog with per-file version selection."""
 
 from datetime import datetime
+from pathlib import Path
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox,
     QPushButton, QScrollArea, QWidget, QMessageBox, QFrame,
-    QButtonGroup, QRadioButton,
+    QButtonGroup, QRadioButton, QLineEdit, QComboBox,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 
 
 class FileRestoreWidget(QWidget):
+    check_changed = Signal()
+
     def __init__(self, item, parent=None):
         super().__init__(parent)
         self.item = item
         self._version_radios = []
+
+        self.setStyleSheet(
+            "FileRestoreWidget { border-bottom: 1px solid #ddd; padding-bottom: 4px; }"
+        )
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 6, 8, 6)
@@ -23,6 +30,7 @@ class FileRestoreWidget(QWidget):
         top_row = QHBoxLayout()
         self._check = QCheckBox()
         self._check.setFixedWidth(30)
+        self._check.stateChanged.connect(self.check_changed.emit)
         top_row.addWidget(self._check, alignment=Qt.AlignTop)
 
         path_label = QLabel(item["source_path"])
@@ -143,26 +151,66 @@ class RestoreDialog(QDialog):
         top_actions.addStretch()
         layout.addLayout(top_actions)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("搜索文件名或路径...")
+        self._search_edit.setStyleSheet(
+            "QLineEdit { padding: 6px 10px; border: 1px solid #ccc; border-radius: 4px; "
+            "font-size: 13px; }"
+            "QLineEdit:focus { border-color: #3B82F6; }"
+        )
+        self._search_edit.textChanged.connect(self._apply_filter)
+        layout.addWidget(self._search_edit)
 
-        container = QWidget()
-        container_layout = QVBoxLayout(container)
-        container_layout.setContentsMargins(0, 0, 0, 0)
-        container_layout.setSpacing(4)
+        filter_row = QHBoxLayout()
+
+        filter_row.addWidget(QLabel("文件类型:"))
+        self._type_combo = QComboBox()
+        self._type_combo.setMinimumWidth(140)
+        self._type_combo.addItem("全部")
+        ext_counts = {}
+        for item in self._restorable:
+            ext = Path(item["original_name"]).suffix
+            if ext:
+                ext_counts[ext] = ext_counts.get(ext, 0) + 1
+        for ext, count in sorted(ext_counts.items(), key=lambda x: -x[1]):
+            self._type_combo.addItem(f"{ext} ({count})")
+        self._type_combo.currentIndexChanged.connect(self._apply_filter)
+        filter_row.addWidget(self._type_combo)
+
+        filter_row.addSpacing(20)
+
+        filter_row.addWidget(QLabel("排序:"))
+        self._sort_combo = QComboBox()
+        self._sort_combo.setMinimumWidth(140)
+        self._sort_combo.addItems(["时间 降序（新→旧）", "时间 升序（旧→新）"])
+        self._sort_combo.currentIndexChanged.connect(self._apply_sort)
+        filter_row.addWidget(self._sort_combo)
+
+        filter_row.addStretch()
+        layout.addLayout(filter_row)
+
+        self._stats_label = QLabel()
+        self._stats_label.setStyleSheet("color: #666; font-size: 12px; margin: 4px 0;")
+        layout.addWidget(self._stats_label)
+
+        self._container_layout = QVBoxLayout()
+        self._container_layout.setContentsMargins(0, 0, 0, 0)
+        self._container_layout.setSpacing(0)
 
         for item in self._restorable:
             item_widget = FileRestoreWidget(item)
+            item_widget.check_changed.connect(self._update_stats)
             self._item_widgets.append(item_widget)
-            container_layout.addWidget(item_widget)
+            self._container_layout.addWidget(item_widget)
 
-            sep = QFrame()
-            sep.setFrameShape(QFrame.HLine)
-            sep.setStyleSheet("color: #ddd;")
-            container_layout.addWidget(sep)
+        self._container_layout.addStretch()
 
-        container_layout.addStretch()
+        container = QWidget()
+        container.setLayout(self._container_layout)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
         scroll.setWidget(container)
         layout.addWidget(scroll, 1)
 
@@ -223,17 +271,72 @@ class RestoreDialog(QDialog):
 
         layout.addLayout(bottom)
 
+        self._update_stats()
+
+    def _apply_filter(self):
+        keyword = self._search_edit.text().lower()
+        ext_text = self._type_combo.currentText()
+        ext = None if ext_text == "全部" else ext_text.split(" ")[0]
+
+        for w in self._item_widgets:
+            name = w.item["original_name"].lower()
+            path = w.item["source_path"].lower()
+            match_ext = ext is None or name.endswith(ext.lower())
+            match_search = not keyword or keyword in name or keyword in path
+            w.setVisible(match_ext and match_search)
+
+        self._apply_sort()
+        self._update_stats()
+
+    def _apply_sort(self):
+        mode = self._sort_combo.currentText()
+        reverse = "降序" in mode
+
+        def sort_key(w):
+            versions = w.item["versions"]
+            if versions:
+                return versions[0]["timestamp"]
+            return ""
+
+        visible_widgets = [w for w in self._item_widgets if w.isVisible()]
+        hidden_widgets = [w for w in self._item_widgets if not w.isVisible()]
+
+        visible_widgets.sort(key=sort_key, reverse=reverse)
+
+        while self._container_layout.count():
+            item = self._container_layout.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
+
+        for w in visible_widgets:
+            self._container_layout.addWidget(w)
+        for w in hidden_widgets:
+            self._container_layout.addWidget(w)
+        self._container_layout.addStretch()
+
+    def _update_stats(self):
+        visible = sum(1 for w in self._item_widgets if w.isVisible())
+        selected = sum(1 for w in self._item_widgets if w.isVisible() and w.is_checked())
+        total = len(self._item_widgets)
+        if visible == total:
+            self._stats_label.setText(f"已选 {selected} / 共 {total} 个文件")
+        else:
+            self._stats_label.setText(f"已选 {selected} / 共 {visible} 个文件（筛选自 {total} 个）")
+
     def _on_select_all(self):
         for w in self._item_widgets:
-            w.set_checked(True)
+            if w.isVisible():
+                w.set_checked(True)
 
     def _on_deselect_all(self):
         for w in self._item_widgets:
-            w.set_checked(False)
+            if w.isVisible():
+                w.set_checked(False)
 
     def _on_select_all_latest(self):
         for w in self._item_widgets:
-            w.set_checked(True)
+            if w.isVisible():
+                w.set_checked(True)
 
     def _on_view_unmatched(self):
         text = "以下文件在备份目录中未找到对应的备份版本：\n\n"

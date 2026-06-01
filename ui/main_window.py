@@ -519,10 +519,7 @@ class MainWindow(QMainWindow):
         log_scan(0, total, elapsed)
         if total > 0:
             self._log(f"发现 {total} 个文件变更 (耗时 {elapsed:.1f}s)")
-            self._tray.show_message(
-                "启动扫描", f"发现 {total} 个文件变更，可执行手动备份",
-                QSystemTrayIcon.Information,
-            )
+            self._process_scan_results(self._config, results)
         else:
             self._log(f"未发现文件变更 (耗时 {elapsed:.1f}s)")
 
