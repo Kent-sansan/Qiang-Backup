@@ -48,7 +48,7 @@ def _cleanup_old_versions(archive_dir, stem, max_versions):
         versions.pop(0)
 
 
-def backup_single_file(source_file, source_root, backup_root, password, max_versions=5):
+def backup_single_file(source_file, source_root, backup_root, password, max_versions=5, batch_id=None):
     """Backup a single file. Returns (success, message)."""
     source_file = Path(source_file)
     source_root = Path(source_root)
@@ -91,7 +91,7 @@ def backup_single_file(source_file, source_root, backup_root, password, max_vers
 
             try:
                 size = source_file.stat().st_size
-                log_backup(str(source_file), str(archive_path), full_hash, size)
+                log_backup(str(source_file), str(archive_path), full_hash, size, batch_id=batch_id)
             except Exception:
                 pass
 
@@ -111,7 +111,7 @@ def backup_single_file(source_file, source_root, backup_root, password, max_vers
 
 
 def backup_folder(source_root, backup_root, extensions, password,
-                  files=None, max_versions=5, progress_cb=None, file_done_cb=None):
+                  files=None, max_versions=5, progress_cb=None, file_done_cb=None, batch_id=None):
     """Backup files in a source folder. files=None means scan all.
     Returns (success_count, total_count)."""
     source_root = Path(source_root)
@@ -131,7 +131,7 @@ def backup_folder(source_root, backup_root, extensions, password,
     total = len(file_list)
     success_count = 0
     for i, f in enumerate(file_list, 1):
-        ok, _ = backup_single_file(f, source_root, backup_root, password, max_versions)
+        ok, _ = backup_single_file(f, source_root, backup_root, password, max_versions, batch_id=batch_id)
         if ok:
             success_count += 1
         if file_done_cb:

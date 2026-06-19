@@ -3,6 +3,7 @@
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -17,16 +18,21 @@ from PySide6.QtGui import QFont, QCloseEvent, QIcon
 
 from ui.tray_icon import TrayIcon
 from engine.config import load_config, save_config
-from engine.change_detector import get_dirty_files
+from engine.change_detector import get_dirty_files, _find_latest_backup_hash
 from engine.backup_engine import backup_folder
 from engine.restore_engine import find_restorable_files, restore_single_file
 from engine.file_watcher import FileWatcher
 from engine.reconciliation import (
-    find_orphaned_backups, check_backup_integrity,
-    delete_orphan_versions, delete_corrupted_backups,
+    find_orphaned_backups,
+    delete_orphan_versions,
 )
-from engine.backup_log import log_scan
+from engine.backup_log import log_scan, get_recent_batches, delete_batch_files
 from utils.autostart import set_autostart
+
+
+def _generate_batch_id():
+    """生成批次ID，格式：batch_YYYYMMDD_HHMMSS"""
+    return f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 
 class LogSignals(QObject):
@@ -87,7 +93,7 @@ class ScanWorker(QRunnable):
 
 class BackupWorker(QRunnable):
     def __init__(self, folder, backup_root, extensions, password,
-                 files, max_versions, signals, on_folder_done=None):
+                 files, max_versions, signals, batch_id=None, on_folder_done=None):
         super().__init__()
         self.folder = folder
         self.backup_root = backup_root
@@ -96,6 +102,7 @@ class BackupWorker(QRunnable):
         self.files = files
         self.max_versions = max_versions
         self.signals = signals
+        self.batch_id = batch_id
         self._on_folder_done = on_folder_done
 
     def run(self):
@@ -113,6 +120,7 @@ class BackupWorker(QRunnable):
                 Path(self.folder), Path(self.backup_root), self.extensions,
                 self.password, files=self.files, max_versions=self.max_versions,
                 progress_cb=on_progress, file_done_cb=on_file_done,
+                batch_id=self.batch_id,
             )
             self.signals.status_signal.emit("就绪")
         finally:
@@ -220,17 +228,18 @@ class RestoreTaskWorker(QRunnable):
         self.signals.finished.emit(success, failed)
 
 
-class IntegrityScanSignals(QObject):
-    result = Signal(object)
-    progress = Signal(int, int, str)
+class ChangeFileScanSignals(QObject):
+    result = Signal(object, object)
+    file_count = Signal(int)
 
 
-class IntegrityScanWorker(QRunnable):
-    def __init__(self, backup_root, extensions, password, signals):
+class ChangeFileScanWorker(QRunnable):
+    def __init__(self, dirty_results, backup_root, source_folders, extensions, signals):
         super().__init__()
+        self.dirty_results = dirty_results
         self.backup_root = backup_root
+        self.source_folders = source_folders
         self.extensions = extensions
-        self.password = password
         self.signals = signals
         self._cancelled = False
 
@@ -238,21 +247,48 @@ class IntegrityScanWorker(QRunnable):
         self._cancelled = True
 
     def run(self):
-        try:
-            def on_progress(current, total, fname):
-                if self._cancelled:
-                    return False
-                self.signals.progress.emit(current, total, fname)
-                return True
+        changed_files = []
+        unbacked_files = []
+        file_counter = 0
 
-            corrupted = check_backup_integrity(
-                self.backup_root, self.extensions, self.password,
-                progress_cb=on_progress,
-            )
+        try:
+            for folder, dirty_files in self.dirty_results.items():
+                source_root = Path(folder)
+                for f in dirty_files:
+                    if self._cancelled:
+                        return
+                    file_counter += 1
+                    if file_counter % 5 == 0:
+                        self.signals.file_count.emit(file_counter)
+
+                    latest_archive, backup_hash, all_hashes = _find_latest_backup_hash(
+                        f, source_root, self.backup_root
+                    )
+
+                    if latest_archive is None:
+                        unbacked_files.append(str(f))
+                    else:
+                        versions = []
+                        import re
+                        safe_stem = f.name
+                        pattern = re.compile(
+                            rf"^{re.escape(safe_stem)}_(\d{{8}})_(\d{{6}})_([0-9a-f]{{16}})\.7z$"
+                        )
+                        backup_dir = latest_archive.parent
+                        for archive in backup_dir.glob("*.7z"):
+                            m = pattern.match(archive.name)
+                            if m:
+                                versions.append({
+                                    "path": archive,
+                                    "timestamp": f"{m.group(1)}_{m.group(2)}",
+                                })
+                        versions.sort(key=lambda v: v["timestamp"], reverse=True)
+                        changed_files.append((str(f), versions))
         except Exception:
-            corrupted = []
+            pass
+
         if not self._cancelled:
-            self.signals.result.emit(corrupted)
+            self.signals.result.emit(changed_files, unbacked_files)
 
 
 class MainWindow(QMainWindow):
@@ -287,13 +323,13 @@ class MainWindow(QMainWindow):
         self._manual_total = 0
         self._manual_scan_running = False
         self._orphan_scan_running = False
-        self._integrity_scan_running = False
         self._restoring = False
         self._quitting = False
         self._restore_msg_shown = False
         self._autostart_syncing = False
+        self._change_scan_running = False
+        self._view_change_scan_running = False
         self._orphan_dialog = None
-        self._integrity_dialog = None
         self._restore_progress = None
 
         self._tray = TrayIcon()
@@ -361,6 +397,7 @@ class MainWindow(QMainWindow):
         self._tray.stop_monitor_signal.connect(self._on_stop_monitor)
         self._tray.quit_signal.connect(self._on_quit)
         self._tray.autostart_toggled_signal.connect(self._on_autostart_toggled)
+        self._tray.undo_backup_signal.connect(self._on_undo_backup)
 
     def _build_ui(self):
         central = QWidget()
@@ -446,6 +483,10 @@ class MainWindow(QMainWindow):
         self._btn_restore.clicked.connect(self._on_one_click_restore)
         action_layout.addWidget(self._btn_restore)
 
+        self._btn_undo = QPushButton("撤销备份")
+        self._btn_undo.clicked.connect(self._on_undo_backup)
+        action_layout.addWidget(self._btn_undo)
+
         self._btn_start = QPushButton("开始监控")
         self._btn_start.clicked.connect(self._on_start_monitor)
         action_layout.addWidget(self._btn_start)
@@ -457,10 +498,6 @@ class MainWindow(QMainWindow):
         self._btn_orphan = QPushButton("孤儿清理")
         self._btn_orphan.clicked.connect(self._on_orphan_cleanup)
         action_layout.addWidget(self._btn_orphan)
-
-        self._btn_integrity = QPushButton("完整性检查")
-        self._btn_integrity.clicked.connect(self._on_integrity_check)
-        action_layout.addWidget(self._btn_integrity)
 
         settings_layout.addLayout(action_layout)
         main_layout.addWidget(settings_box)
@@ -614,17 +651,29 @@ class MainWindow(QMainWindow):
         msg = (f"检测到 {total_files} 个变动文件\n"
                f"总大小: {size_mb:.1f} MB\n"
                f"预计耗时: {est_str}\n\n"
-               f"是否开始备份？")
+               f"请选择操作：")
 
-        reply = QMessageBox.question(self, "确认备份", msg,
-                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-        if reply != QMessageBox.Yes:
-            self._log("── 手动备份：用户取消 ──")
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("检测到变动文件")
+        msg_box.setText(msg)
+        msg_box.setIcon(QMessageBox.Question)
+        view_btn = msg_box.addButton("查看变动", QMessageBox.YesRole)
+        cancel_btn = msg_box.addButton("取消", QMessageBox.RejectRole)
+        msg_box.setDefaultButton(view_btn)
+        msg_box.exec()
+
+        clicked = msg_box.clickedButton()
+        if clicked == cancel_btn:
+            self._log("── 用户取消 ──")
             return
+
+        self._log("── 查看变动文件 ──")
+        self._start_view_change_files(cfg, results)
 
         pending_count = len(results)
         self._manual_pending = pending_count
         self._manual_total = pending_count
+        batch_id = _generate_batch_id()
 
         for folder, dirty in results.items():
             self._log(f"备份: {folder} ({len(dirty)} 个文件)")
@@ -634,8 +683,9 @@ class MainWindow(QMainWindow):
                     self._manual_pending -= 1
                     if self._manual_pending <= 0:
                         self._log("── 手动备份完成 ──")
-                        self._show_complete_signal.emit(
-                            f"手动备份已完成，共处理 {self._manual_total} 个文件夹。"
+                        self._tray.show_message(
+                            "手动备份完成",
+                            f"已备份 {self._manual_total} 个文件夹"
                         )
                 return on_one_done
 
@@ -644,6 +694,108 @@ class MainWindow(QMainWindow):
                 files=[str(f) for f in dirty],
                 max_versions=cfg.get("max_versions", 5),
                 signals=self._signals,
+                batch_id=batch_id,
+                on_folder_done=make_on_done(),
+            )
+            self._threadpool.start(worker)
+
+    def _start_view_change_files(self, cfg, results):
+        valid_folders = [f for f in cfg.get("source_folders", []) if Path(f).exists()]
+        if not valid_folders or not cfg.get("backup_root"):
+            return
+
+        self._view_change_scan_running = True
+
+        progress, label = self._create_progress("获取版本信息", "正在处理...")
+
+        scan_signals = ChangeFileScanSignals()
+        worker = ChangeFileScanWorker(
+            results, cfg["backup_root"], valid_folders, cfg["extensions"], scan_signals
+        )
+        worker_holder = [worker]
+
+        def on_file_count(count):
+            label.setText(f"已处理 {count} 个文件...")
+
+        def on_finished(changed_files, unbacked_files):
+            progress.close()
+            self._view_change_scan_running = False
+            self._show_view_change_files_dialog(cfg, changed_files, unbacked_files)
+
+        def on_cancelled():
+            worker_holder[0].cancel()
+            self._view_change_scan_running = False
+
+        scan_signals.file_count.connect(on_file_count)
+        scan_signals.result.connect(on_finished)
+        progress.rejected.connect(on_cancelled)
+        self._threadpool.start(worker)
+
+    def _show_view_change_files_dialog(self, cfg, changed_files, unbacked_files):
+        if not changed_files and not unbacked_files:
+            QMessageBox.information(self, "提示", "没有变动或未备份的文件。")
+            return
+
+        from ui.change_files_dialog import ChangeFilesDialog
+        dialog = ChangeFilesDialog(
+            changed_files, unbacked_files, cfg.get("backup_root", ""), self,
+            title="查看变动文件"
+        )
+        dialog.backup_selected_signal.connect(lambda files: self._execute_backup_from_dialog(cfg, files))
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selected = dialog.get_selected_restore_list()
+        if not selected:
+            return
+
+        self._log("正在恢复选中的变动文件...")
+        task_signals = RestoreTaskSignals()
+        task_signals.log.connect(self._log)
+        task_signals.status.connect(self._set_status)
+        task_signals.finished.connect(self._on_restore_task_done)
+        self._restoring = True
+        self._threadpool.start(RestoreTaskWorker(
+            selected, cfg.get("password", ""), task_signals
+        ))
+
+    def _execute_backup_from_dialog(self, cfg, files):
+        batch_id = _generate_batch_id()
+        valid_folders = [f for f in cfg.get("source_folders", []) if Path(f).exists()]
+
+        files_by_folder = {}
+        for f in files:
+            f_path = Path(f)
+            for folder in valid_folders:
+                try:
+                    f_path.relative_to(folder)
+                    files_by_folder.setdefault(folder, []).append(f)
+                    break
+                except ValueError:
+                    continue
+
+        pending_count = len(files_by_folder)
+        self._manual_pending = pending_count
+        self._manual_total = pending_count
+
+        for folder, folder_files in files_by_folder.items():
+            self._log(f"备份: {folder} ({len(folder_files)} 个文件)")
+
+            def make_on_done():
+                def on_one_done():
+                    self._manual_pending -= 1
+                    if self._manual_pending <= 0:
+                        self._log("── 备份完成 ──")
+                        self._tray.show_message("备份完成", f"已备份 {self._manual_total} 个文件夹")
+                return on_one_done
+
+            worker = BackupWorker(
+                folder, cfg["backup_root"], cfg["extensions"], cfg["password"],
+                files=folder_files,
+                max_versions=cfg.get("max_versions", 5),
+                signals=self._signals,
+                batch_id=batch_id,
                 on_folder_done=make_on_done(),
             )
             self._threadpool.start(worker)
@@ -790,11 +942,22 @@ class MainWindow(QMainWindow):
             for src_root, dirty in dirty_by_root.items():
                 self._log(f"监控: {src_root} ({len(dirty)} 个变更)")
 
+                batch_id = _generate_batch_id()
+                total_files = len(dirty)
+
+                def on_folder_done():
+                    self._tray.show_message(
+                        "监控备份完成",
+                        f"已备份 {total_files} 个文件"
+                    )
+
                 worker = BackupWorker(
                     src_root, cfg["backup_root"], cfg["extensions"],
                     cfg["password"], files=[str(f) for f in dirty],
                     max_versions=cfg.get("max_versions", 5),
                     signals=self._signals,
+                    batch_id=batch_id,
+                    on_folder_done=on_folder_done,
                 )
                 self._threadpool.start(worker)
 
@@ -814,6 +977,32 @@ class MainWindow(QMainWindow):
         self._monitor_label.setText("⚪ 已停止")
         self._tray.set_monitoring_active(False)
         self._log("🔴 文件监控已停止")
+
+    # --- Undo backup ---
+    def _on_undo_backup(self):
+        batches = get_recent_batches(limit=10)
+        if not batches:
+            QMessageBox.information(self, "撤销备份", "没有可撤销的备份记录。")
+            return
+
+        from ui.undo_dialog import UndoDialog
+        dialog = UndoDialog(batches, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selected = dialog.get_selected_batches()
+        if not selected:
+            return
+
+        total_deleted = 0
+        for batch in selected:
+            batch_id = batch["batch_id"]
+            deleted = delete_batch_files(batch_id)
+            total_deleted += deleted
+            self._log(f"已撤销批次 {batch_id}，删除 {deleted} 个文件")
+
+        QMessageBox.information(self, "撤销完成", f"已删除 {total_deleted} 个备份文件。")
+        self._tray.show_message("撤销完成", f"已删除 {total_deleted} 个备份文件")
 
     # --- Orphan cleanup ---
     def _on_orphan_cleanup(self):
@@ -872,73 +1061,6 @@ class MainWindow(QMainWindow):
 
         orphan_signals.result.connect(on_done)
         orphan_signals.file_count.connect(on_file_count)
-        progress.rejected.connect(on_cancelled)
-        self._threadpool.start(worker)
-
-    # --- Integrity check ---
-    def _on_integrity_check(self):
-        if self._integrity_scan_running:
-            return
-
-        cfg = self._config
-        backup_root = cfg.get("backup_root", "")
-        if not backup_root:
-            QMessageBox.warning(self, "提示", "请先设置备份路径。")
-            return
-        if not Path(backup_root).exists():
-            QMessageBox.warning(self, "提示", f"备份目录不存在或无法访问:\n{backup_root}")
-            return
-
-        self._integrity_scan_running = True
-
-        progress, label = self._create_progress("完整性检查", "已检查 0 个文件...")
-
-        integrity_signals = IntegrityScanSignals()
-        worker = IntegrityScanWorker(
-            cfg["backup_root"], cfg["extensions"], cfg.get("password", ""),
-            integrity_signals,
-        )
-
-        def on_progress(current, total, fname):
-            label.setText(f"已检查 {current} 个文件...")
-
-        def on_cancelled():
-            worker.cancel()
-            self._integrity_scan_running = False
-            try:
-                progress.close()
-            except Exception:
-                pass
-
-        def on_done(corrupted):
-            self._integrity_scan_running = False
-            try:
-                progress.close()
-            except Exception:
-                pass
-            if not corrupted:
-                backup_path = Path(backup_root)
-                has_archives = backup_path.exists() and any(backup_path.rglob("*.7z"))
-                if has_archives:
-                    QMessageBox.information(self, "完整性检查", "所有备份文件完好。")
-                else:
-                    QMessageBox.information(self, "完整性检查", "备份目录中没有存档文件。")
-                return
-
-            from ui.integrity_dialog import IntegrityDialog
-            self._integrity_dialog = IntegrityDialog(
-                corrupted, cfg["backup_root"], self
-            )
-            if self._integrity_dialog.exec() == QDialog.DialogCode.Accepted:
-                selected = self._integrity_dialog.get_selected()
-                if selected:
-                    deleted = delete_corrupted_backups(selected, cfg["backup_root"])
-                    self._log(f"已删除 {deleted} 个损坏的备份")
-                    QMessageBox.information(self, "完成", f"已删除 {deleted} 个损坏文件。")
-            self._integrity_dialog = None
-
-        integrity_signals.progress.connect(on_progress)
-        integrity_signals.result.connect(on_done)
         progress.rejected.connect(on_cancelled)
         self._threadpool.start(worker)
 
@@ -1055,12 +1177,6 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self._orphan_dialog = None
-        if self._integrity_dialog:
-            try:
-                self._integrity_dialog.reject()
-            except Exception:
-                pass
-            self._integrity_dialog = None
         try:
             self._watcher.stop()
         except Exception:

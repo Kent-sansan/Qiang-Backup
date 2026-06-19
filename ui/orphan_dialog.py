@@ -9,11 +9,17 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 
+from utils.file_utils import create_file_context_menu
+
 
 class OrphanItemWidget(QWidget):
     def __init__(self, item, parent=None):
         super().__init__(parent)
         self.item = item
+        
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
+        
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 6, 8, 6)
 
@@ -48,6 +54,14 @@ class OrphanItemWidget(QWidget):
         text_layout.addWidget(versions_label)
 
         layout.addLayout(text_layout, 1)
+
+    def _show_context_menu(self, position):
+        """Show context menu with options to open source/backup directories."""
+        source_path = str(Path(self.item["relative_dir"]) / self.item["original_name"])
+        backup_path = str(self.item["versions"][0]["path"]) if self.item["versions"] else None
+        
+        menu = create_file_context_menu(self, source_path, backup_path)
+        menu.exec_(self.mapToGlobal(position))
 
     def is_checked(self):
         return self._check.isChecked()

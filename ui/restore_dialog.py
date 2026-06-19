@@ -10,18 +10,24 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal
 
+from utils.file_utils import create_file_context_menu
+
 
 class FileRestoreWidget(QWidget):
     check_changed = Signal()
 
-    def __init__(self, item, parent=None):
+    def __init__(self, item, backup_root, parent=None):
         super().__init__(parent)
         self.item = item
+        self.backup_root = backup_root
         self._version_radios = []
 
         self.setStyleSheet(
             "FileRestoreWidget { border-bottom: 1px solid #ddd; padding-bottom: 4px; }"
         )
+
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 6, 8, 6)
@@ -92,6 +98,16 @@ class FileRestoreWidget(QWidget):
         bottom_row.addWidget(count_label)
         bottom_row.addStretch()
         outer.addLayout(bottom_row)
+
+    def _show_context_menu(self, position):
+        """Show context menu with options to open source/backup directories."""
+        source_path = self.item["source_path"]
+        backup_path = None
+        if self.item["versions"]:
+            backup_path = self.item["versions"][0]["path"]
+        
+        menu = create_file_context_menu(self, source_path, backup_path)
+        menu.exec_(self.mapToGlobal(position))
 
     def _on_select_latest(self):
         if self._version_radios:
@@ -198,7 +214,7 @@ class RestoreDialog(QDialog):
         self._container_layout.setSpacing(0)
 
         for item in self._restorable:
-            item_widget = FileRestoreWidget(item)
+            item_widget = FileRestoreWidget(item, self._backup_root)
             item_widget.check_changed.connect(self._update_stats)
             self._item_widgets.append(item_widget)
             self._container_layout.addWidget(item_widget)

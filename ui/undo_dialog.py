@@ -1,7 +1,6 @@
-"""Corrupted backup integrity dialog."""
+"""Undo backup dialog for selecting and deleting backup batches."""
 
 from datetime import datetime
-from pathlib import Path
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox,
@@ -9,16 +8,11 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 
-from utils.file_utils import create_file_context_menu
 
-
-class CorruptedItemWidget(QWidget):
-    def __init__(self, item, parent=None):
+class BatchItemWidget(QWidget):
+    def __init__(self, batch, parent=None):
         super().__init__(parent)
-        self.item = item
-        
-        self.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.customContextMenuRequested.connect(self._show_context_menu)
+        self.batch = batch
         
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 6, 8, 6)
@@ -30,32 +24,31 @@ class CorruptedItemWidget(QWidget):
         text_layout = QVBoxLayout()
         text_layout.setSpacing(2)
 
-        path_label = QLabel(f"{item['relative_dir']}/{item['original_name']}")
-        path_label.setStyleSheet("font-weight: bold; font-size: 13px;")
-        text_layout.addWidget(path_label)
-
-        backup_label = QLabel(f"损坏文件: {item['path']}")
-        backup_label.setStyleSheet("color: #E53E3E; font-size: 12px;")
-        text_layout.addWidget(backup_label)
-
+        batch_id = batch["batch_id"]
         try:
-            dt = datetime.strptime(item["timestamp"], "%Y%m%d_%H%M%S")
-            ts_display = dt.strftime("%Y-%m-%d %H:%M")
+            ts_str = batch_id.replace("batch_", "")
+            dt = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+            display_time = dt.strftime("%Y-%m-%d %H:%M:%S")
         except ValueError:
-            ts_display = item["timestamp"]
-        ts_label = QLabel(f"备份时间: {ts_display}")
-        ts_label.setStyleSheet("color: #888; font-size: 12px;")
-        text_layout.addWidget(ts_label)
+            display_time = batch_id
+
+        time_label = QLabel(f"备份时间: {display_time}")
+        time_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+        text_layout.addWidget(time_label)
+
+        count_label = QLabel(f"文件数量: {batch['count']} 个")
+        count_label.setStyleSheet("color: #666; font-size: 12px;")
+        text_layout.addWidget(count_label)
+
+        files_text = "\n".join(batch["files"][:5])
+        if batch["count"] > 5:
+            files_text += f"\n... 还有 {batch['count'] - 5} 个文件"
+        files_label = QLabel(files_text)
+        files_label.setStyleSheet("color: #888; font-size: 11px;")
+        files_label.setWordWrap(True)
+        text_layout.addWidget(files_label)
 
         layout.addLayout(text_layout, 1)
-
-    def _show_context_menu(self, position):
-        """Show context menu with options to open source/backup directories."""
-        source_path = str(Path(self.item["relative_dir"]) / self.item["original_name"])
-        backup_path = str(self.item["path"]) if self.item.get("path") else None
-        
-        menu = create_file_context_menu(self, source_path, backup_path)
-        menu.exec_(self.mapToGlobal(position))
 
     def is_checked(self):
         return self._check.isChecked()
@@ -64,17 +57,16 @@ class CorruptedItemWidget(QWidget):
         self._check.setChecked(checked)
 
 
-class IntegrityDialog(QDialog):
-    def __init__(self, corrupted_items, backup_root, parent=None):
+class UndoDialog(QDialog):
+    def __init__(self, batches, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("备份完整性检测")
+        self.setWindowTitle("撤销备份")
         self.setMinimumSize(580, 400)
         self.resize(680, 500)
         self.setModal(True)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
 
-        self._corrupted = corrupted_items
-        self._backup_root = backup_root
+        self._batches = batches
         self._item_widgets = []
 
         self._build_ui()
@@ -83,8 +75,8 @@ class IntegrityDialog(QDialog):
         layout = QVBoxLayout(self)
 
         header = QLabel(
-            f"完整性检测发现 {len(self._corrupted)} 个备份文件已损坏或无法打开。\n"
-            "这些备份文件无法恢复，建议删除："
+            f"发现 {len(self._batches)} 个备份批次。\n"
+            "选择要撤销的批次（将删除该批次的所有备份文件）："
         )
         header.setWordWrap(True)
         header.setStyleSheet("font-size: 14px; margin-bottom: 8px;")
@@ -99,8 +91,8 @@ class IntegrityDialog(QDialog):
         container_layout.setContentsMargins(0, 0, 0, 0)
         container_layout.setSpacing(4)
 
-        for item in self._corrupted:
-            item_widget = CorruptedItemWidget(item)
+        for batch in self._batches:
+            item_widget = BatchItemWidget(batch)
             self._item_widgets.append(item_widget)
             container_layout.addWidget(item_widget)
 
@@ -137,12 +129,12 @@ class IntegrityDialog(QDialog):
 
         bottom_layout.addStretch()
 
-        keep_btn = QPushButton("全部保留")
-        keep_btn.setFixedWidth(100)
-        keep_btn.clicked.connect(self.reject)
-        bottom_layout.addWidget(keep_btn)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setFixedWidth(80)
+        cancel_btn.clicked.connect(self.reject)
+        bottom_layout.addWidget(cancel_btn)
 
-        delete_btn = QPushButton("删除选中")
+        delete_btn = QPushButton("撤销选中")
         delete_btn.setFixedWidth(100)
         delete_btn.setStyleSheet(
             "QPushButton { background-color: #E53E3E; color: white; border: none; "
@@ -163,19 +155,22 @@ class IntegrityDialog(QDialog):
             w.set_checked(False)
 
     def _on_delete_selected(self):
-        selected = [w.item for w in self._item_widgets if w.is_checked()]
+        selected = [w.batch for w in self._item_widgets if w.is_checked()]
         if not selected:
-            QMessageBox.information(self, "提示", "未选中任何文件。")
+            QMessageBox.information(self, "提示", "未选中任何批次。")
             return
 
+        total_files = sum(b["count"] for b in selected)
+
         reply = QMessageBox.question(
-            self, "确认删除",
-            f"将删除 {len(selected)} 个已损坏的备份文件。\n\n"
-            "此操作不可恢复，确认删除？",
+            self, "确认撤销",
+            f"将删除 {len(selected)} 个批次的 {total_files} 个备份文件。\n\n"
+            "此操作不可恢复，确认撤销？",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
+            self._selected_batches = selected
             self.accept()
 
-    def get_selected(self):
-        return [w.item for w in self._item_widgets if w.is_checked()]
+    def get_selected_batches(self):
+        return getattr(self, "_selected_batches", [])
