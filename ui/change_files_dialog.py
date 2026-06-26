@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal
 
+from utils.file_utils import create_file_context_menu
+
 
 # Windows Shell API — 发送到回收站
 class SHFILEOPSTRUCTW(ctypes.Structure):
@@ -90,6 +92,8 @@ class LockedFileItemWidget(QWidget):
             "LockedFileItemWidget { border-bottom: 1px solid #ddd; padding-bottom: 4px; "
             "background-color: #FFF5F5; }"
         )
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 6, 8, 6)
         outer.setSpacing(4)
@@ -113,6 +117,10 @@ class LockedFileItemWidget(QWidget):
         status_label = QLabel("被锁定 — 无法备份")
         status_label.setStyleSheet("color: #E53E3E; font-size: 12px;")
         outer.addWidget(status_label)
+
+    def _show_context_menu(self, position):
+        menu = create_file_context_menu(self, self.file_path)
+        menu.exec_(self.mapToGlobal(position))
 
     def is_checked(self):
         return self._check.isChecked()

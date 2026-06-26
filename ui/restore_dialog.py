@@ -140,6 +140,8 @@ class LockedFileRestoreWidget(QWidget):
             "LockedFileRestoreWidget { border-bottom: 1px solid #ddd; padding-bottom: 4px; "
             "background-color: #FFF5F5; }"
         )
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 6, 8, 6)
@@ -206,6 +208,10 @@ class LockedFileRestoreWidget(QWidget):
                 self._version_radios[0].setChecked(True)
 
             outer.addLayout(self._version_layout)
+
+    def _show_context_menu(self, position):
+        menu = create_file_context_menu(self, self.item.get("source_path"))
+        menu.exec_(self.mapToGlobal(position))
 
     def is_checked(self):
         return self._check.isChecked()
