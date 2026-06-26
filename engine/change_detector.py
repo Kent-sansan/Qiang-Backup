@@ -24,7 +24,10 @@ def safe_rglob(root, extensions):
             if _is_junction_or_symlink(entry):
                 continue
             if entry.is_dir():
-                yield from safe_rglob(entry, extensions)
+                if entry.name.lower() == "$recycle.bin":
+                    continue
+                if extensions:
+                    yield from safe_rglob(entry, extensions)
             elif any(entry.name.lower().endswith(ext.lower()) for ext in extensions):
                 yield entry
     except (OSError, PermissionError):
@@ -41,6 +44,24 @@ def _compute_sha256(file_path):
         return h.hexdigest()
     except OSError:
         return None
+
+
+def _is_file_locked(file_path):
+    """Check if a file is locked by another process.
+    
+    广联达文件锁定检测：文件头字节 12 44
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            header = f.read(2)
+            # 检测广联达文件锁定（文件头字节 12 44）
+            if header == b'\x12\x44':
+                return True
+            return False
+    except FileNotFoundError:
+        return False  # 文件不存在，不是被锁
+    except (IOError, OSError):
+        return True
 
 
 def _compute_safe_stem(filename):
@@ -113,14 +134,25 @@ def compute_file_hash16(file_path):
     return full_hash[:16]
 
 
-def get_dirty_files(source_folder, backup_root, extensions, source_root=None, progress_cb=None):
+def get_dirty_files(source_folder, backup_root, extensions, source_root=None, 
+                    progress_cb=None, scan_locked=True, files=None):
     """Scan a source folder and return list of files that need backup.
 
     A file needs backup if:
     - No backup archive exists for it (new file)
     - Its current content hash is not in any known backup hash set
 
-    progress_cb(file_path) is called for each scanned file.
+    Args:
+        source_folder: Source folder path
+        backup_root: Backup root path
+        extensions: File extensions to scan
+        source_root: Source root path (for mirror directory)
+        progress_cb: Progress callback function
+        scan_locked: Whether to scan for locked files (default True)
+        files: Optional pre-filtered list of Path objects to check instead of scanning
+    
+    Returns:
+        tuple: (dirty_files, locked_files)
     """
     source_folder = Path(source_folder)
     if source_root is None:
@@ -128,13 +160,25 @@ def get_dirty_files(source_folder, backup_root, extensions, source_root=None, pr
     source_root = Path(source_root)
     backup_root = Path(backup_root)
     dirty = []
+    locked = []
 
-    if not source_folder.exists():
-        return dirty
+    # 快速路径：指定文件列表时直接使用，否则全量扫描
+    if files is not None:
+        file_list = files
+    elif source_folder.exists():
+        file_list = list(safe_rglob(source_folder, extensions))
+    else:
+        return dirty, locked
 
-    for f in safe_rglob(source_folder, extensions):
+    for f in file_list:
         if progress_cb and not progress_cb(f):
             break
+        
+        # 先快速检查文件头是否被锁定，避免后续哈希计算浪费
+        if scan_locked and _is_file_locked(f):
+            locked.append(f)
+            continue
+        
         latest_archive, backup_hash, all_hashes = _find_latest_backup_hash(f, source_root, backup_root)
 
         if latest_archive is None:
@@ -148,16 +192,36 @@ def get_dirty_files(source_folder, backup_root, extensions, source_root=None, pr
         if current_hash not in all_hashes:
             dirty.append(f)
 
-    return dirty
+    return dirty, locked
 
 
-def scan_all_sources(source_folders, backup_root, extensions, progress_cb=None):
-    """Scan all source folders, return {folder: [dirty_files]} and total count."""
+def scan_all_sources(source_folders, backup_root, extensions, progress_cb=None, scan_locked=True):
+    """Scan all source folders, return {folder: [dirty_files]} and locked files.
+    
+    Args:
+        source_folders: List of source folder paths
+        backup_root: Backup root path
+        extensions: File extensions to scan
+        progress_cb: Progress callback function
+        scan_locked: Whether to scan for locked files (default True)
+    
+    Returns:
+        tuple: (results_dict, locked_files_list)
+    """
     results = {}
+    all_locked = []
     total = 0
+    
     for folder in source_folders:
-        dirty = get_dirty_files(folder, backup_root, extensions, progress_cb=progress_cb)
+        dirty, locked = get_dirty_files(
+            folder, backup_root, extensions, 
+            progress_cb=progress_cb, 
+            scan_locked=scan_locked
+        )
         if dirty:
             results[folder] = dirty
             total += len(dirty)
-    return results, total
+        if locked:
+            all_locked.extend(locked)
+    
+    return results, all_locked

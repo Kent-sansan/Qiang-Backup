@@ -26,12 +26,11 @@ class DebounceFileHandler(FileSystemEventHandler):
             return False
         return any(lowered.endswith(ext) for ext in self.extensions)
 
-    def _schedule(self, folder_path):
-        folder_path = str(folder_path)
+    def _schedule(self, file_path):
         with self._lock:
             if self._shutdown:
                 return
-            self._pending_folders.add(folder_path)
+            self._pending_folders.add(str(file_path))
             now = time.monotonic()
             if self._first_event_time is None:
                 self._first_event_time = now
@@ -75,25 +74,22 @@ class DebounceFileHandler(FileSystemEventHandler):
 
     def on_modified(self, event):
         if not event.is_directory and self._should_handle(event.src_path):
-            self._schedule(Path(event.src_path).parent)
+            self._schedule(event.src_path)
 
     def on_created(self, event):
         if not event.is_directory and self._should_handle(event.src_path):
-            self._schedule(Path(event.src_path).parent)
+            self._schedule(event.src_path)
 
     def on_deleted(self, event):
         if not event.is_directory and self._should_handle(event.src_path):
-            self._schedule(Path(event.src_path).parent)
+            self._schedule(event.src_path)
 
     def on_moved(self, event):
-        if event.is_directory:
-            self._schedule(Path(event.src_path).parent)
-            self._schedule(Path(event.dest_path).parent)
-        else:
+        if not event.is_directory:
             if self._should_handle(event.dest_path):
-                self._schedule(Path(event.dest_path).parent)
+                self._schedule(event.dest_path)
             if self._should_handle(event.src_path):
-                self._schedule(Path(event.src_path).parent)
+                self._schedule(event.src_path)
 
 
 class FileWatcher:

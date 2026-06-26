@@ -10,11 +10,14 @@ from engine.backup_log import log_restore, log_error
 
 
 def find_restorable_files(source_folders, backup_root, extensions, progress_cb=None):
-    """Scan source folders and backup directory, return (restorable_list, unmatched_list).
+    """Scan source folders and backup directory, return (restorable_list, unmatched_list, locked_list).
     progress_cb(count) -> bool: return False to cancel."""
+    from engine.change_detector import _is_file_locked
+    
     backup_root = Path(backup_root)
     restorable = []
     unmatched = []
+    locked_files = []
     file_counter = 0
     if progress_cb:
         progress_cb(0)
@@ -28,7 +31,38 @@ def find_restorable_files(source_folders, backup_root, extensions, progress_cb=N
             file_counter += 1
             if progress_cb and file_counter % 5 == 0:
                 if not progress_cb(file_counter):
-                    return restorable, unmatched
+                    return restorable, unmatched, locked_files
+            
+            # 检查文件是否被锁定
+            if _is_file_locked(source_file):
+                # 被锁文件也需要查找备份版本
+                safe_stem = _compute_safe_stem(source_file.name)
+                mirror_dir = _get_relative_mirror_dir(source_file, source_root)
+                backup_dir = backup_root / mirror_dir
+                
+                versions = []
+                if backup_dir.exists():
+                    pattern = re.compile(
+                        rf"^{re.escape(safe_stem)}_(\d{{8}})_(\d{{6}})_([0-9a-f]{{16}})\.7z$"
+                    )
+                    for archive in backup_dir.glob("*.7z"):
+                        m = pattern.match(archive.name)
+                        if m:
+                            versions.append({
+                                "path": archive,
+                                "timestamp": f"{m.group(1)}_{m.group(2)}",
+                            })
+                    versions.sort(key=lambda v: v["timestamp"], reverse=True)
+                
+                if versions:
+                    locked_files.append({
+                        "source_path": str(source_file),
+                        "relative_dir": mirror_dir,
+                        "original_name": source_file.name,
+                        "versions": versions,
+                    })
+                continue
+            
             safe_stem = _compute_safe_stem(source_file.name)
             mirror_dir = _get_relative_mirror_dir(source_file, source_root)
             backup_dir = backup_root / mirror_dir
@@ -61,7 +95,7 @@ def find_restorable_files(source_folders, backup_root, extensions, progress_cb=N
             else:
                 unmatched.append(str(source_file))
 
-    return restorable, unmatched
+    return restorable, unmatched, locked_files
 
 
 def restore_single_file(archive_path, source_path, password):

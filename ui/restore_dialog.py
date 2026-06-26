@@ -6,7 +6,7 @@ from pathlib import Path
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox,
     QPushButton, QScrollArea, QWidget, QMessageBox, QFrame,
-    QButtonGroup, QRadioButton, QLineEdit, QComboBox,
+    QButtonGroup, QRadioButton, QLineEdit, QComboBox, QTabWidget,
 )
 from PySide6.QtCore import Qt, Signal
 
@@ -126,8 +126,104 @@ class FileRestoreWidget(QWidget):
         return self.item["versions"][idx]
 
 
+class LockedFileRestoreWidget(QWidget):
+    """被锁文件恢复控件"""
+    check_changed = Signal()
+
+    def __init__(self, item, backup_root, parent=None):
+        super().__init__(parent)
+        self.item = item
+        self.backup_root = backup_root
+        self._version_radios = []
+
+        self.setStyleSheet(
+            "LockedFileRestoreWidget { border-bottom: 1px solid #ddd; padding-bottom: 4px; "
+            "background-color: #FFF5F5; }"
+        )
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(4)
+
+        top_row = QHBoxLayout()
+        self._check = QCheckBox()
+        self._check.setFixedWidth(30)
+        self._check.stateChanged.connect(self.check_changed.emit)
+        top_row.addWidget(self._check, alignment=Qt.AlignTop)
+
+        # 锁定图标
+        lock_label = QLabel("🔒")
+        lock_label.setStyleSheet("font-size: 14px;")
+        top_row.addWidget(lock_label)
+
+        # 文件路径
+        path_label = QLabel(item["source_path"])
+        path_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #E53E3E;")
+        path_label.setWordWrap(True)
+        top_row.addWidget(path_label, 1)
+        outer.addLayout(top_row)
+
+        # 疑似被锁标签
+        locked_label = QLabel("疑似被锁")
+        locked_label.setStyleSheet("color: #E53E3E; font-size: 12px; font-weight: bold;")
+        outer.addWidget(locked_label)
+
+        # 版本选择
+        if item.get("versions"):
+            self._version_layout = QVBoxLayout()
+            self._version_layout.setContentsMargins(30, 0, 0, 0)
+            self._version_layout.setSpacing(2)
+
+            self._radio_group = QButtonGroup(self)
+            for i, ver in enumerate(item["versions"]):
+                radio = QRadioButton()
+                self._version_radios.append(radio)
+                self._radio_group.addButton(radio, i)
+
+                row = QHBoxLayout()
+                row.setSpacing(6)
+                row.addWidget(radio)
+                try:
+                    dt = datetime.strptime(ver["timestamp"], "%Y%m%d_%H%M%S")
+                    label_text = dt.strftime("%Y-%m-%d %H:%M")
+                except ValueError:
+                    label_text = ver["timestamp"]
+
+                ver_label = QLabel(label_text)
+                ver_label.setStyleSheet("font-size: 12px;")
+                row.addWidget(ver_label)
+
+                if i == 0:
+                    suffix = " (最新)"
+                    latest_label = QLabel(suffix)
+                    latest_label.setStyleSheet("color: #3B82F6; font-size: 12px;")
+                    row.addWidget(latest_label)
+
+                row.addStretch()
+                self._version_layout.addLayout(row)
+
+            if item["versions"]:
+                self._version_radios[0].setChecked(True)
+
+            outer.addLayout(self._version_layout)
+
+    def is_checked(self):
+        return self._check.isChecked()
+
+    def set_checked(self, checked):
+        self._check.setChecked(checked)
+
+    def selected_version(self):
+        if not self._version_radios:
+            return None
+        idx = self._radio_group.checkedId()
+        if idx < 0 or idx >= len(self.item.get("versions", [])):
+            return None
+        return self.item["versions"][idx]
+
+
 class RestoreDialog(QDialog):
-    def __init__(self, restorable, unmatched, backup_root, parent=None):
+    def __init__(self, restorable, unmatched, backup_root, locked_files=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("一键恢复")
         self.setMinimumSize(620, 450)
@@ -137,36 +233,83 @@ class RestoreDialog(QDialog):
 
         self._restorable = restorable
         self._unmatched = unmatched
+        self._locked_files = locked_files or []
         self._backup_root = backup_root
         self._item_widgets = []
+        self._locked_item_widgets = []
 
         self._build_ui()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
 
-        total_versions = sum(len(item["versions"]) for item in self._restorable)
-        header = QLabel(
-            f"发现 {len(self._restorable)} 个文件，{total_versions} 个备份版本可恢复\n"
-            "选择要恢复的文件并指定版本："
-        )
-        header.setWordWrap(True)
-        header.setStyleSheet("font-size: 14px; margin-bottom: 8px;")
-        layout.addWidget(header)
+        self._tab_widget = QTabWidget()
+        layout.addWidget(self._tab_widget)
 
-        top_actions = QHBoxLayout()
-        select_all_latest_btn = QPushButton("全选最新版本")
-        select_all_latest_btn.setFixedWidth(110)
-        select_all_latest_btn.setStyleSheet(
-            "QPushButton { font-size: 12px; padding: 3px 12px; border: 1px solid #3B82F6; "
-            "border-radius: 3px; color: #3B82F6; }"
-            "QPushButton:hover { background: #EFF6FF; }"
-        )
-        select_all_latest_btn.clicked.connect(self._on_select_all_latest)
-        top_actions.addWidget(select_all_latest_btn)
-        top_actions.addStretch()
-        layout.addLayout(top_actions)
+        # Tab 1: 备份恢复
+        backup_tab = self._build_backup_tab()
+        self._tab_widget.addTab(backup_tab, f"备份恢复 ({len(self._restorable)})")
 
+        # Tab 2: 被锁文件恢复
+        if self._locked_files:
+            locked_tab = self._build_locked_tab()
+            self._tab_widget.addTab(locked_tab, f"被锁文件恢复 ({len(self._locked_files)})")
+
+        bottom = QHBoxLayout()
+
+        select_all_btn = QPushButton("全选")
+        select_all_btn.setFixedWidth(60)
+        select_all_btn.setStyleSheet(
+            "QPushButton { font-size: 12px; padding: 3px 10px; border: 1px solid #ccc; "
+            "border-radius: 3px; }"
+            "QPushButton:hover { background: #e0e0e0; }"
+        )
+        select_all_btn.clicked.connect(self._on_select_all)
+        bottom.addWidget(select_all_btn)
+
+        deselect_all_btn = QPushButton("取消全选")
+        deselect_all_btn.setFixedWidth(80)
+        deselect_all_btn.setStyleSheet(
+            "QPushButton { font-size: 12px; padding: 3px 10px; border: 1px solid #ccc; "
+            "border-radius: 3px; }"
+            "QPushButton:hover { background: #e0e0e0; }"
+        )
+        deselect_all_btn.clicked.connect(self._on_deselect_all)
+        bottom.addWidget(deselect_all_btn)
+
+        bottom.addStretch()
+
+        self._stats_label = QLabel()
+        self._stats_label.setStyleSheet("color: #666; font-size: 12px;")
+        bottom.addWidget(self._stats_label)
+
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setFixedWidth(80)
+        cancel_btn.clicked.connect(self.reject)
+        bottom.addWidget(cancel_btn)
+
+        self._restore_btn = QPushButton("恢复选中")
+        self._restore_btn.setFixedWidth(120)
+        self._restore_btn.setStyleSheet(
+            "QPushButton { background-color: #3B82F6; color: white; border: none; "
+            "border-radius: 4px; padding: 6px 16px; font-weight: bold; }"
+            "QPushButton:hover { background-color: #2563EB; }"
+        )
+        self._restore_btn.clicked.connect(self._on_restore_selected)
+        bottom.addWidget(self._restore_btn)
+
+        layout.addLayout(bottom)
+
+        self._tab_widget.currentChanged.connect(self._update_stats)
+        self._update_stats()
+
+    def _build_backup_tab(self):
+        """构建备份恢复标签页"""
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 搜索框
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText("搜索文件名或路径...")
         self._search_edit.setStyleSheet(
@@ -175,8 +318,9 @@ class RestoreDialog(QDialog):
             "QLineEdit:focus { border-color: #3B82F6; }"
         )
         self._search_edit.textChanged.connect(self._apply_filter)
-        layout.addWidget(self._search_edit)
+        tab_layout.addWidget(self._search_edit)
 
+        # 过滤和排序
         filter_row = QHBoxLayout()
 
         filter_row.addWidget(QLabel("文件类型:"))
@@ -203,12 +347,9 @@ class RestoreDialog(QDialog):
         filter_row.addWidget(self._sort_combo)
 
         filter_row.addStretch()
-        layout.addLayout(filter_row)
+        tab_layout.addLayout(filter_row)
 
-        self._stats_label = QLabel()
-        self._stats_label.setStyleSheet("color: #666; font-size: 12px; margin: 4px 0;")
-        layout.addWidget(self._stats_label)
-
+        # 文件列表
         self._container_layout = QVBoxLayout()
         self._container_layout.setContentsMargins(0, 0, 0, 0)
         self._container_layout.setSpacing(0)
@@ -228,66 +369,63 @@ class RestoreDialog(QDialog):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setWidget(container)
-        layout.addWidget(scroll, 1)
+        tab_layout.addWidget(scroll, 1)
 
-        bottom = QHBoxLayout()
-
-        select_all_btn = QPushButton("全选")
-        select_all_btn.setFixedWidth(60)
-        select_all_btn.setStyleSheet(
-            "QPushButton { font-size: 12px; padding: 3px 10px; border: 1px solid #ccc; "
-            "border-radius: 3px; }"
-            "QPushButton:hover { background: #e0e0e0; }"
+        # 全选最新版本按钮
+        top_actions = QHBoxLayout()
+        select_all_latest_btn = QPushButton("全选最新版本")
+        select_all_latest_btn.setFixedWidth(110)
+        select_all_latest_btn.setStyleSheet(
+            "QPushButton { font-size: 12px; padding: 3px 12px; border: 1px solid #3B82F6; "
+            "border-radius: 3px; color: #3B82F6; }"
+            "QPushButton:hover { background: #EFF6FF; }"
         )
-        select_all_btn.clicked.connect(self._on_select_all)
-        bottom.addWidget(select_all_btn)
+        select_all_latest_btn.clicked.connect(self._on_select_all_latest)
+        top_actions.addWidget(select_all_latest_btn)
+        top_actions.addStretch()
+        tab_layout.addLayout(top_actions)
 
-        deselect_all_btn = QPushButton("取消全选")
-        deselect_all_btn.setFixedWidth(80)
-        deselect_all_btn.setStyleSheet(
-            "QPushButton { font-size: 12px; padding: 3px 10px; border: 1px solid #ccc; "
-            "border-radius: 3px; }"
-            "QPushButton:hover { background: #e0e0e0; }"
+        return tab
+
+    def _build_locked_tab(self):
+        """构建被锁文件恢复标签页"""
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 说明信息
+        info_label = QLabel(
+            f"已扫描到被锁文件，并可从备份中恢复：\n"
+            f"发现 {len(self._locked_files)} 个文件"
         )
-        deselect_all_btn.clicked.connect(self._on_deselect_all)
-        bottom.addWidget(deselect_all_btn)
-
-        bottom.addStretch()
-
-        unmatched_count = len(self._unmatched)
-        if unmatched_count > 0:
-            unmatched_label = QLabel(f"匹配不到备份的文件: {unmatched_count} 个")
-            unmatched_label.setStyleSheet("color: #888; font-size: 12px;")
-            bottom.addWidget(unmatched_label)
-
-            view_btn = QPushButton("查看")
-            view_btn.setFixedWidth(50)
-            view_btn.setStyleSheet(
-                "QPushButton { font-size: 11px; padding: 2px 6px; border: 1px solid #ccc; "
-                "border-radius: 3px; }"
-                "QPushButton:hover { background: #e0e0e0; }"
-            )
-            view_btn.clicked.connect(self._on_view_unmatched)
-            bottom.addWidget(view_btn)
-
-        cancel_btn = QPushButton("取消")
-        cancel_btn.setFixedWidth(80)
-        cancel_btn.clicked.connect(self.reject)
-        bottom.addWidget(cancel_btn)
-
-        self._restore_btn = QPushButton("恢复选中")
-        self._restore_btn.setFixedWidth(120)
-        self._restore_btn.setStyleSheet(
-            "QPushButton { background-color: #3B82F6; color: white; border: none; "
-            "border-radius: 4px; padding: 6px 16px; font-weight: bold; }"
-            "QPushButton:hover { background-color: #2563EB; }"
+        info_label.setStyleSheet(
+            "color: #E53E3E; font-size: 12px; padding: 10px; "
+            "background-color: #FFF5F5; border-bottom: 1px solid #E53E3E;"
         )
-        self._restore_btn.clicked.connect(self._on_restore_selected)
-        bottom.addWidget(self._restore_btn)
+        info_label.setWordWrap(True)
+        tab_layout.addWidget(info_label)
 
-        layout.addLayout(bottom)
+        # 文件列表
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
 
-        self._update_stats()
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+
+        for item in self._locked_files:
+            item_widget = LockedFileRestoreWidget(item, self._backup_root)
+            item_widget.check_changed.connect(self._update_stats)
+            self._locked_item_widgets.append(item_widget)
+            container_layout.addWidget(item_widget)
+
+        container_layout.addStretch()
+        scroll.setWidget(container)
+        tab_layout.addWidget(scroll, 1)
+
+        return tab
 
     def _apply_filter(self):
         keyword = self._search_edit.text().lower()
@@ -331,40 +469,65 @@ class RestoreDialog(QDialog):
         self._container_layout.addStretch()
 
     def _update_stats(self):
-        visible = sum(1 for w in self._item_widgets if w.isVisible())
-        selected = sum(1 for w in self._item_widgets if w.isVisible() and w.is_checked())
-        total = len(self._item_widgets)
-        if visible == total:
-            self._stats_label.setText(f"已选 {selected} / 共 {total} 个文件")
+        current_tab = self._tab_widget.currentIndex()
+        if current_tab == 0:
+            widgets = self._item_widgets
+            label = "备份恢复"
         else:
-            self._stats_label.setText(f"已选 {selected} / 共 {visible} 个文件（筛选自 {total} 个）")
+            widgets = self._locked_item_widgets
+            label = "被锁文件恢复"
+
+        visible = sum(1 for w in widgets if w.isVisible())
+        selected = sum(1 for w in widgets if w.isVisible() and w.is_checked())
+        total = len(widgets)
+
+        if visible == total:
+            self._stats_label.setText(f"{label}: 已选 {selected} / 共 {total} 个文件")
+        else:
+            self._stats_label.setText(f"{label}: 已选 {selected} / 共 {visible} 个文件（筛选自 {total} 个）")
 
     def _on_select_all(self):
-        for w in self._item_widgets:
+        current_tab = self._tab_widget.currentIndex()
+        if current_tab == 0:
+            widgets = self._item_widgets
+        else:
+            widgets = self._locked_item_widgets
+        
+        for w in widgets:
             if w.isVisible():
                 w.set_checked(True)
+        self._update_stats()
 
     def _on_deselect_all(self):
-        for w in self._item_widgets:
+        current_tab = self._tab_widget.currentIndex()
+        if current_tab == 0:
+            widgets = self._item_widgets
+        else:
+            widgets = self._locked_item_widgets
+        
+        for w in widgets:
             if w.isVisible():
                 w.set_checked(False)
+        self._update_stats()
 
     def _on_select_all_latest(self):
         for w in self._item_widgets:
             if w.isVisible():
                 w.set_checked(True)
 
-    def _on_view_unmatched(self):
-        text = "以下文件在备份目录中未找到对应的备份版本：\n\n"
-        text += "\n".join(self._unmatched)
-        QMessageBox.information(self, "未匹配文件列表", text)
-
     def _on_restore_selected(self):
-        selected = [
-            (w.item["source_path"], w.selected_version())
-            for w in self._item_widgets
-            if w.is_checked() and w.selected_version() is not None
-        ]
+        selected = []
+        
+        # 从备份恢复标签页获取选中项
+        for w in self._item_widgets:
+            if w.is_checked() and w.selected_version() is not None:
+                selected.append((w.item["source_path"], w.selected_version()))
+        
+        # 从被锁文件恢复标签页获取选中项
+        for w in self._locked_item_widgets:
+            if w.is_checked() and w.selected_version() is not None:
+                selected.append((w.item["source_path"], w.selected_version()))
+
         if not selected:
             QMessageBox.information(self, "提示", "未选中任何文件。")
             return

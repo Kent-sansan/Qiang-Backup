@@ -26,7 +26,7 @@ from engine.reconciliation import (
     find_orphaned_backups,
     delete_orphan_versions,
 )
-from engine.backup_log import log_scan, get_recent_batches, delete_batch_files
+from engine.backup_log import log_scan
 from utils.autostart import set_autostart
 
 
@@ -43,23 +43,28 @@ class LogSignals(QObject):
 class ScanSignals(QObject):
     progress = Signal(str)
     file_count = Signal(int)
-    finished = Signal(object, float)
+    finished = Signal(object, object, float)  # results, locked_files, elapsed
 
 
 class ScanWorker(QRunnable):
-    def __init__(self, source_folders, backup_root, extensions, signals):
+    def __init__(self, source_folders, backup_root, extensions, signals, scan_locked=True, locked_only=False):
         super().__init__()
         self.source_folders = source_folders
         self.backup_root = backup_root
         self.extensions = extensions
         self.signals = signals
+        self.scan_locked = scan_locked
+        self.locked_only = locked_only
         self._cancelled = False
 
     def cancel(self):
         self._cancelled = True
 
     def run(self):
+        from engine.change_detector import safe_rglob, _is_file_locked
+
         results = {}
+        all_locked = []
         total = 0
         file_counter = [0]
         start = time.monotonic()
@@ -78,17 +83,31 @@ class ScanWorker(QRunnable):
                 if self._cancelled:
                     break
                 self.signals.progress.emit(f"正在扫描 {folder}...")
-                dirty = get_dirty_files(folder, self.backup_root, self.extensions, progress_cb=on_file)
-                if self._cancelled:
-                    break
-                if dirty:
-                    results[folder] = dirty
-                    total += len(dirty)
+
+                if self.locked_only:
+                    # 全盘扫描模式：仅检测被锁文件，跳过哈希比对
+                    for f in safe_rglob(Path(folder), self.extensions):
+                        if not on_file(f):
+                            break
+                        if _is_file_locked(f):
+                            all_locked.append(f)
+                else:
+                    dirty, locked = get_dirty_files(
+                        folder, self.backup_root, self.extensions,
+                        progress_cb=on_file, scan_locked=self.scan_locked
+                    )
+                    if self._cancelled:
+                        break
+                    if dirty:
+                        results[folder] = dirty
+                        total += len(dirty)
+                    if locked:
+                        all_locked.extend(locked)
         except Exception:
             pass
         elapsed = time.monotonic() - start
         if not self._cancelled:
-            self.signals.finished.emit(results, elapsed)
+            self.signals.finished.emit(results, all_locked, elapsed)
 
 
 class BackupWorker(QRunnable):
@@ -164,7 +183,7 @@ class OrphanScanWorker(QRunnable):
 
 
 class RestoreScanSignals(QObject):
-    result = Signal(object, object)
+    result = Signal(object, object, object)  # restorable, unmatched, locked_files
     file_count = Signal(int)
 
 
@@ -188,14 +207,14 @@ class RestoreScanWorker(QRunnable):
                 self.signals.file_count.emit(count)
                 return True
 
-            restorable, unmatched = find_restorable_files(
+            restorable, unmatched, locked_files = find_restorable_files(
                 self.source_folders, self.backup_root, self.extensions,
                 progress_cb=on_progress,
             )
         except Exception:
-            restorable, unmatched = [], []
+            restorable, unmatched, locked_files = [], [], []
         if not self._cancelled:
-            self.signals.result.emit(restorable, unmatched)
+            self.signals.result.emit(restorable, unmatched, locked_files)
 
 
 class RestoreTaskSignals(QObject):
@@ -229,18 +248,19 @@ class RestoreTaskWorker(QRunnable):
 
 
 class ChangeFileScanSignals(QObject):
-    result = Signal(object, object)
+    result = Signal(object, object, object)  # changed_files, unbacked_files, locked_files
     file_count = Signal(int)
 
 
 class ChangeFileScanWorker(QRunnable):
-    def __init__(self, dirty_results, backup_root, source_folders, extensions, signals):
+    def __init__(self, dirty_results, backup_root, source_folders, extensions, signals, locked_files=None):
         super().__init__()
         self.dirty_results = dirty_results
         self.backup_root = backup_root
         self.source_folders = source_folders
         self.extensions = extensions
         self.signals = signals
+        self.locked_files = locked_files or []
         self._cancelled = False
 
     def cancel(self):
@@ -288,7 +308,7 @@ class ChangeFileScanWorker(QRunnable):
             pass
 
         if not self._cancelled:
-            self.signals.result.emit(changed_files, unbacked_files)
+            self.signals.result.emit(changed_files, unbacked_files, self.locked_files)
 
 
 class MainWindow(QMainWindow):
@@ -334,6 +354,7 @@ class MainWindow(QMainWindow):
 
         self._tray = TrayIcon()
         self._setup_tray_signals()
+        self._tray.show()  # 提前显示托盘图标，避免启动扫码期间无托盘
 
         self._build_ui()
         self._load_config_to_ui()
@@ -369,9 +390,9 @@ class MainWindow(QMainWindow):
         def on_count(n):
             count_label.setText(f"已扫描 {n} 个文件")
 
-        def on_finished(results, elapsed):
+        def on_finished(results, locked_files, elapsed):
             dlg.accept()
-            self._on_startup_scan_done(results, elapsed)
+            self._on_startup_scan_done(results, locked_files, elapsed)
             self._finish_startup()
 
         scan_signals.file_count.connect(on_count)
@@ -397,7 +418,6 @@ class MainWindow(QMainWindow):
         self._tray.stop_monitor_signal.connect(self._on_stop_monitor)
         self._tray.quit_signal.connect(self._on_quit)
         self._tray.autostart_toggled_signal.connect(self._on_autostart_toggled)
-        self._tray.undo_backup_signal.connect(self._on_undo_backup)
 
     def _build_ui(self):
         central = QWidget()
@@ -459,11 +479,6 @@ class MainWindow(QMainWindow):
         self._max_versions_spin = QSpinBox()
         self._max_versions_spin.setRange(1, 99)
         adv_layout.addWidget(self._max_versions_spin)
-        adv_layout.addWidget(QLabel("异常阈值:"))
-        self._anomaly_threshold_spin = QSpinBox()
-        self._anomaly_threshold_spin.setRange(1, 999)
-        self._anomaly_threshold_spin.setToolTip("同时变动文件数超过此值将暂停监控")
-        adv_layout.addWidget(self._anomaly_threshold_spin)
         adv_layout.addStretch()
         self._autostart_check = QCheckBox("开机自启")
         self._autostart_check.stateChanged.connect(self._on_ui_autostart_changed)
@@ -471,21 +486,6 @@ class MainWindow(QMainWindow):
         settings_layout.addLayout(adv_layout)
 
         action_layout = QHBoxLayout()
-        self._btn_save = QPushButton("保存配置")
-        self._btn_save.clicked.connect(self._on_save_config)
-        action_layout.addWidget(self._btn_save)
-
-        self._btn_manual = QPushButton("手动备份")
-        self._btn_manual.clicked.connect(self._on_manual_backup)
-        action_layout.addWidget(self._btn_manual)
-
-        self._btn_restore = QPushButton("一键恢复")
-        self._btn_restore.clicked.connect(self._on_one_click_restore)
-        action_layout.addWidget(self._btn_restore)
-
-        self._btn_undo = QPushButton("撤销备份")
-        self._btn_undo.clicked.connect(self._on_undo_backup)
-        action_layout.addWidget(self._btn_undo)
 
         self._btn_start = QPushButton("开始监控")
         self._btn_start.clicked.connect(self._on_start_monitor)
@@ -495,9 +495,21 @@ class MainWindow(QMainWindow):
         self._btn_stop.clicked.connect(self._on_stop_monitor)
         action_layout.addWidget(self._btn_stop)
 
+        self._btn_manual = QPushButton("手动备份")
+        self._btn_manual.clicked.connect(self._on_manual_backup)
+        action_layout.addWidget(self._btn_manual)
+
+        self._btn_restore = QPushButton("一键恢复")
+        self._btn_restore.clicked.connect(self._on_one_click_restore)
+        action_layout.addWidget(self._btn_restore)
+
         self._btn_orphan = QPushButton("孤儿清理")
         self._btn_orphan.clicked.connect(self._on_orphan_cleanup)
         action_layout.addWidget(self._btn_orphan)
+
+        self._btn_scan_locked = QPushButton("全盘扫描")
+        self._btn_scan_locked.clicked.connect(self._on_scan_locked_files)
+        action_layout.addWidget(self._btn_scan_locked)
 
         settings_layout.addLayout(action_layout)
         main_layout.addWidget(settings_box)
@@ -526,9 +538,27 @@ class MainWindow(QMainWindow):
         self._pwd_edit.setText(self._config.get("password", ""))
         self._debounce_spin.setValue(self._config.get("debounce_seconds", 3))
         self._max_versions_spin.setValue(self._config.get("max_versions", 5))
-        self._anomaly_threshold_spin.setValue(self._config.get("anomaly_threshold", 3))
         self._autostart_check.setChecked(self._config.get("autostart", False))
         self._tray.set_autostart_checked(self._config.get("autostart", False))
+
+        # 自动保存：配置项改动时自动保存
+        self._connect_auto_save()
+
+    def _connect_auto_save(self):
+        for widget in [self._backup_root_edit, self._pwd_edit]:
+            widget.textChanged.connect(self._auto_save_config)
+        self._ext_edit.textChanged.connect(self._auto_save_config)
+        for spin in [self._debounce_spin, self._max_versions_spin]:
+            spin.valueChanged.connect(self._auto_save_config)
+        self._source_list.model().rowsInserted.connect(self._auto_save_config)
+        self._source_list.model().rowsRemoved.connect(self._auto_save_config)
+
+    def _auto_save_config(self):
+        try:
+            save_config(self._collect_config_from_ui())
+            self._config = self._collect_config_from_ui()
+        except Exception:
+            pass
 
     def _collect_config_from_ui(self):
         return {
@@ -546,23 +576,26 @@ class MainWindow(QMainWindow):
             "password": self._pwd_edit.text(),
             "debounce_seconds": self._debounce_spin.value(),
             "max_versions": self._max_versions_spin.value(),
-            "anomaly_threshold": self._anomaly_threshold_spin.value(),
             "autostart": self._autostart_check.isChecked(),
             "monitor_was_running": self._watcher.is_running(),
         }
 
-    def _on_startup_scan_done(self, results, elapsed):
+    def _on_startup_scan_done(self, results, locked_files, elapsed):
         total = sum(len(v) for v in results.values())
         log_scan(0, total, elapsed)
-        if total > 0:
-            self._log(f"发现 {total} 个文件变更 (耗时 {elapsed:.1f}s)")
-            self._process_scan_results(self._config, results)
+        if total > 0 or locked_files:
+            if total > 0:
+                self._log(f"发现 {total} 个文件变更 (耗时 {elapsed:.1f}s)")
+            if locked_files:
+                self._log(f"发现 {len(locked_files)} 个被锁文件")
+            self._process_scan_results(self._config, results, locked_files)
         else:
             self._log(f"未发现文件变更 (耗时 {elapsed:.1f}s)")
 
         self._start_orphan_check()
 
-        if self._config.get("monitor_was_running", False):
+        # 自动开启监控（除非检测到被锁文件）
+        if not locked_files:
             self._on_start_monitor()
 
     def _start_orphan_check(self):
@@ -615,10 +648,10 @@ class MainWindow(QMainWindow):
         def on_file_count(count):
             label.setText(f"已扫描 {count} 个文件...")
 
-        def on_finished(results, _elapsed):
+        def on_finished(results, locked_files, _elapsed):
             progress.close()
             self._manual_scan_running = False
-            self._process_scan_results(cfg, results)
+            self._process_scan_results(cfg, results, locked_files)
 
         def on_cancelled():
             worker_holder[0].cancel()
@@ -629,136 +662,48 @@ class MainWindow(QMainWindow):
         progress.rejected.connect(on_cancelled)
         self._threadpool.start(worker)
 
-    def _process_scan_results(self, cfg, results):
-        if not results:
+    def _process_scan_results(self, cfg, results, locked_files=None):
+        if not results and not locked_files:
             QMessageBox.information(self, "提示", "没有检测到变动的文件。")
             self._log("── 手动备份：无变动文件 ──")
             return
 
-        total_files = sum(len(v) for v in results.values())
-        total_size = 0
+        # 直接弹出大弹窗（两个标签页：未备份文件 + 被锁定文件）
+        self._log("── 查看变动文件 ──")
+        self._start_view_change_files(cfg, results, locked_files)
+
+    def _start_view_change_files(self, cfg, results, locked_files=None):
+        # 从 results 收集所有未备份文件
+        unbacked_files = []
         for folder, files in results.items():
             for f in files:
-                try:
-                    total_size += f.stat().st_size
-                except OSError:
-                    pass
+                unbacked_files.append(str(f))
 
-        size_mb = total_size / (1024 * 1024) if total_size > 0 else 0
-        est_seconds = total_size / (10 * 1024 * 1024) if total_size > 0 else 0
-        est_str = f"{int(est_seconds)} 秒" if est_seconds < 60 else f"{est_seconds / 60:.1f} 分钟"
+        # 确保被锁文件不在未备份列表中（分流），同时转字符串
+        locked_paths = set(str(f) for f in (locked_files or []))
+        unbacked_files = [f for f in unbacked_files if f not in locked_paths]
+        locked_files = [str(f) for f in (locked_files or [])]
 
-        msg = (f"检测到 {total_files} 个变动文件\n"
-               f"总大小: {size_mb:.1f} MB\n"
-               f"预计耗时: {est_str}\n\n"
-               f"请选择操作：")
+        # 直接弹出 ChangeFilesDialog
+        self._show_view_change_files_dialog(cfg, [], unbacked_files, locked_files)
 
-        msg_box = QMessageBox(self)
-        msg_box.setWindowTitle("检测到变动文件")
-        msg_box.setText(msg)
-        msg_box.setIcon(QMessageBox.Question)
-        view_btn = msg_box.addButton("查看变动", QMessageBox.YesRole)
-        cancel_btn = msg_box.addButton("取消", QMessageBox.RejectRole)
-        msg_box.setDefaultButton(view_btn)
-        msg_box.exec()
-
-        clicked = msg_box.clickedButton()
-        if clicked == cancel_btn:
-            self._log("── 用户取消 ──")
-            return
-
-        self._log("── 查看变动文件 ──")
-        self._start_view_change_files(cfg, results)
-
-        pending_count = len(results)
-        self._manual_pending = pending_count
-        self._manual_total = pending_count
-        batch_id = _generate_batch_id()
-
-        for folder, dirty in results.items():
-            self._log(f"备份: {folder} ({len(dirty)} 个文件)")
-
-            def make_on_done():
-                def on_one_done():
-                    self._manual_pending -= 1
-                    if self._manual_pending <= 0:
-                        self._log("── 手动备份完成 ──")
-                        self._tray.show_message(
-                            "手动备份完成",
-                            f"已备份 {self._manual_total} 个文件夹"
-                        )
-                return on_one_done
-
-            worker = BackupWorker(
-                folder, cfg["backup_root"], cfg["extensions"], cfg["password"],
-                files=[str(f) for f in dirty],
-                max_versions=cfg.get("max_versions", 5),
-                signals=self._signals,
-                batch_id=batch_id,
-                on_folder_done=make_on_done(),
-            )
-            self._threadpool.start(worker)
-
-    def _start_view_change_files(self, cfg, results):
-        valid_folders = [f for f in cfg.get("source_folders", []) if Path(f).exists()]
-        if not valid_folders or not cfg.get("backup_root"):
-            return
-
-        self._view_change_scan_running = True
-
-        progress, label = self._create_progress("获取版本信息", "正在处理...")
-
-        scan_signals = ChangeFileScanSignals()
-        worker = ChangeFileScanWorker(
-            results, cfg["backup_root"], valid_folders, cfg["extensions"], scan_signals
-        )
-        worker_holder = [worker]
-
-        def on_file_count(count):
-            label.setText(f"已处理 {count} 个文件...")
-
-        def on_finished(changed_files, unbacked_files):
-            progress.close()
-            self._view_change_scan_running = False
-            self._show_view_change_files_dialog(cfg, changed_files, unbacked_files)
-
-        def on_cancelled():
-            worker_holder[0].cancel()
-            self._view_change_scan_running = False
-
-        scan_signals.file_count.connect(on_file_count)
-        scan_signals.result.connect(on_finished)
-        progress.rejected.connect(on_cancelled)
-        self._threadpool.start(worker)
-
-    def _show_view_change_files_dialog(self, cfg, changed_files, unbacked_files):
-        if not changed_files and not unbacked_files:
+    def _show_view_change_files_dialog(self, cfg, changed_files, unbacked_files, locked_files=None):
+        if not unbacked_files and not locked_files:
             QMessageBox.information(self, "提示", "没有变动或未备份的文件。")
             return
 
         from ui.change_files_dialog import ChangeFilesDialog
         dialog = ChangeFilesDialog(
-            changed_files, unbacked_files, cfg.get("backup_root", ""), self,
+            [], unbacked_files, cfg.get("backup_root", ""),
+            locked_files=locked_files, parent=self,
             title="查看变动文件"
         )
         dialog.backup_selected_signal.connect(lambda files: self._execute_backup_from_dialog(cfg, files))
-
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        selected = dialog.get_selected_restore_list()
-        if not selected:
-            return
-
-        self._log("正在恢复选中的变动文件...")
-        task_signals = RestoreTaskSignals()
-        task_signals.log.connect(self._log)
-        task_signals.status.connect(self._set_status)
-        task_signals.finished.connect(self._on_restore_task_done)
-        self._restoring = True
-        self._threadpool.start(RestoreTaskWorker(
-            selected, cfg.get("password", ""), task_signals
-        ))
+        try:
+            dialog.exec()
+        except Exception as e:
+            self._log(f"弹窗出错: {e}")
+            QMessageBox.warning(self, "错误", f"无法打开文件查看窗口:\n{e}")
 
     def _execute_backup_from_dialog(self, cfg, files):
         batch_id = _generate_batch_id()
@@ -844,7 +789,7 @@ class MainWindow(QMainWindow):
         worker_holder = [worker]
         self._threadpool.start(worker)
 
-    def _on_restore_scan_done(self, restorable, unmatched):
+    def _on_restore_scan_done(self, restorable, unmatched, locked_files=None):
         self._restore_scan_running = False
         if self._restore_progress:
             try:
@@ -853,12 +798,13 @@ class MainWindow(QMainWindow):
                 pass
             self._restore_progress = None
 
-        if not restorable:
+        if not restorable and not locked_files:
             QMessageBox.information(self, "一键恢复", "未发现可恢复的文件。")
             return
 
         from ui.restore_dialog import RestoreDialog
-        dialog = RestoreDialog(restorable, unmatched, self._restore_cfg["backup_root"], self)
+        dialog = RestoreDialog(restorable, unmatched, self._restore_cfg["backup_root"], 
+                              locked_files=locked_files, parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             self._log("── 一键恢复：用户取消 ──")
             return
@@ -897,7 +843,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "无法启动", "没有有效的源文件夹。")
             return
 
-        def on_folder_changed(folder_paths):
+        def on_folder_changed(file_paths):
             if self._restoring:
                 return
 
@@ -905,38 +851,42 @@ class MainWindow(QMainWindow):
             seen = set()
             dirty_by_root = {}
 
-            for fp in folder_paths:
+            # 按源根目录分组文件，传递文件列表实现快速路径
+            files_by_root = {}
+            for fp in file_paths:
                 fp_path = Path(fp)
-                src_root = None
+                # 过滤备份归档和临时文件，避免孤儿清理等操作触发误备份
+                name_lower = fp_path.name.lower()
+                if name_lower.endswith(('.7z', '.tmp', '~')):
+                    continue
                 for cr in config_roots:
                     try:
                         fp_path.relative_to(cr)
-                        src_root = str(cr)
+                        files_by_root.setdefault(str(cr), []).append(fp_path)
                         break
                     except ValueError:
                         continue
-                if src_root is None:
-                    src_root = str(fp_path)
 
-                dirty = get_dirty_files(str(fp), cfg["backup_root"], cfg["extensions"], source_root=src_root)
+            for src_root, files in files_by_root.items():
+                dirty, locked = get_dirty_files(
+                    src_root, cfg["backup_root"], cfg["extensions"],
+                    source_root=src_root, files=files
+                )
+                if locked:
+                    self._log(f"监控检测到 {len(locked)} 个被锁文件，监控已停止")
+                    self._tray.show_message(
+                        "检测到被锁文件",
+                        f"检测到 {len(locked)} 个被锁文件，监控已停止",
+                        QSystemTrayIcon.Warning,
+                    )
+                    self._on_stop_monitor()
+                    return
                 for f in dirty:
                     if str(f) not in seen:
                         seen.add(str(f))
                         dirty_by_root.setdefault(src_root, []).append(f)
 
             if not dirty_by_root:
-                return
-
-            total_dirty = len(seen)
-            threshold = cfg.get("anomaly_threshold", 3)
-            if total_dirty >= threshold:
-                self._log(f"异常检测：{total_dirty} 个文件同时变动，监控已暂停")
-                self._tray.show_message(
-                    "异常检测",
-                    f"发现 {total_dirty} 个文件变更，监控已暂停",
-                    QSystemTrayIcon.Warning,
-                )
-                self._on_stop_monitor()
                 return
 
             for src_root, dirty in dirty_by_root.items():
@@ -977,32 +927,6 @@ class MainWindow(QMainWindow):
         self._monitor_label.setText("⚪ 已停止")
         self._tray.set_monitoring_active(False)
         self._log("🔴 文件监控已停止")
-
-    # --- Undo backup ---
-    def _on_undo_backup(self):
-        batches = get_recent_batches(limit=10)
-        if not batches:
-            QMessageBox.information(self, "撤销备份", "没有可撤销的备份记录。")
-            return
-
-        from ui.undo_dialog import UndoDialog
-        dialog = UndoDialog(batches, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        selected = dialog.get_selected_batches()
-        if not selected:
-            return
-
-        total_deleted = 0
-        for batch in selected:
-            batch_id = batch["batch_id"]
-            deleted = delete_batch_files(batch_id)
-            total_deleted += deleted
-            self._log(f"已撤销批次 {batch_id}，删除 {deleted} 个文件")
-
-        QMessageBox.information(self, "撤销完成", f"已删除 {total_deleted} 个备份文件。")
-        self._tray.show_message("撤销完成", f"已删除 {total_deleted} 个备份文件")
 
     # --- Orphan cleanup ---
     def _on_orphan_cleanup(self):
@@ -1061,6 +985,57 @@ class MainWindow(QMainWindow):
 
         orphan_signals.result.connect(on_done)
         orphan_signals.file_count.connect(on_file_count)
+        progress.rejected.connect(on_cancelled)
+        self._threadpool.start(worker)
+
+    # --- Scan locked files ---
+    def _on_scan_locked_files(self):
+        """全盘扫描被锁文件 — 扫描整个电脑所有驱动器"""
+        cfg = self._collect_config_from_ui()
+        extensions = cfg["extensions"]
+
+        if not extensions:
+            QMessageBox.warning(self, "全盘扫描", "请先设置文件扩展名后再扫描。")
+            return
+
+        # 获取所有可用驱动器
+        import string
+        all_drives = []
+        for drive in string.ascii_uppercase:
+            drive_path = Path(f"{drive}:\\")
+            if drive_path.exists():
+                all_drives.append(f"{drive}:\\")
+
+        if not all_drives:
+            QMessageBox.information(self, "提示", "未找到可用磁盘。")
+            return
+
+        self._log("全盘扫描被锁文件...")
+
+        progress, label = self._create_progress("全盘扫描被锁文件", "已扫描 0 个文件...")
+        scan_signals = ScanSignals()
+        worker = ScanWorker(all_drives, cfg["backup_root"], extensions, scan_signals, scan_locked=True, locked_only=True)
+
+        def on_file_count(count):
+            label.setText(f"已扫描 {count} 个文件...")
+
+        def on_finished(results, locked_files, elapsed):
+            progress.close()
+            self._log(f"扫描完成，发现 {len(locked_files)} 个被锁文件")
+
+            if not locked_files:
+                QMessageBox.information(self, "全盘扫描被锁文件", "未发现被锁文件。")
+                return
+
+            from ui.locked_files_dialog import LockedFilesDialog
+            dialog = LockedFilesDialog([str(f) for f in locked_files], self)
+            dialog.exec()
+
+        def on_cancelled():
+            worker.cancel()
+
+        scan_signals.file_count.connect(on_file_count)
+        scan_signals.finished.connect(on_finished)
         progress.rejected.connect(on_cancelled)
         self._threadpool.start(worker)
 

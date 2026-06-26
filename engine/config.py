@@ -18,7 +18,6 @@ DEFAULT_CONFIG = {
     "password": "强哥备份",
     "debounce_seconds": 3,
     "max_versions": 5,
-    "anomaly_threshold": 3,
     "autostart": False,
     "monitor_was_running": False,
 }

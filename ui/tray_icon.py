@@ -27,7 +27,6 @@ class TrayIcon(QObject):
     stop_monitor_signal = Signal()
     quit_signal = Signal()
     autostart_toggled_signal = Signal(bool)
-    undo_backup_signal = Signal()
 
     def __init__(self, icon_path=None):
         super().__init__()
@@ -61,10 +60,6 @@ class TrayIcon(QObject):
         self._backup_action = QAction("手动备份", self._menu)
         self._backup_action.triggered.connect(self.manual_backup_signal.emit)
         self._menu.addAction(self._backup_action)
-
-        self._undo_action = QAction("撤销最近备份", self._menu)
-        self._undo_action.triggered.connect(self.undo_backup_signal.emit)
-        self._menu.addAction(self._undo_action)
         self._menu.addSeparator()
 
         self._start_action = QAction("开始监控", self._menu)
