@@ -117,24 +117,9 @@
 
 ---
 
-## 打包备份被锁文件自检工具\lock_checker_gui.bat`
+## 打包
 
-**命令行版**：
-```bash
-python tools\1-备份被锁文件自检工具\lock_checker.py D:\强哥备份 强哥备份
 ```
-
-### 2-被锁文件恢复工具
-
-从 `.cc` 格式的旧备份中匹配恢复被锁的广联达文件。
-
-**GUI 版**：双击 `tools\2-被锁文件恢复工具\recovery_tool.bat`
-
-**CC 文件头扫描**：
-```bash
-python tools\2-被锁文件恢复工具\cc_header_scan.py D:\AI工程备份
+pip install pyinstaller
+pyinstaller QiangBackup.spec
 ```
-
-所有工具完全独立，不依赖主程序，可单独分发使用。
-
----
