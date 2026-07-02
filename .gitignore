@@ -1,0 +1,11 @@
+build/
+dist/
+tools/
+__pycache__/
+*.pyc
+*.pyo
+*.spec.bak
+backup.log
+config.json
+engine/mft_scanner.py
+test_mft.py
