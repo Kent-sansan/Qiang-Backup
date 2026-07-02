@@ -16,8 +16,8 @@ def _is_junction_or_symlink(path):
         return True
 
 
-def safe_rglob(root, extensions):
-    """Recursively glob files matching extensions, skipping symlinks/junctions."""
+def _safe_rglob_slow(root, extensions):
+    """Traditional recursive traversal (fallback)."""
     root = Path(root)
     try:
         for entry in root.iterdir():
@@ -27,11 +27,29 @@ def safe_rglob(root, extensions):
                 if entry.name.lower() == "$recycle.bin":
                     continue
                 if extensions:
-                    yield from safe_rglob(entry, extensions)
+                    yield from _safe_rglob_slow(entry, extensions)
             elif any(entry.name.lower().endswith(ext.lower()) for ext in extensions):
                 yield entry
     except (OSError, PermissionError):
         pass
+
+
+def safe_rglob(root, extensions):
+    """Recursively glob files matching extensions, skipping symlinks/junctions.
+    Uses fast Win32 API when available, falls back to traditional traversal."""
+    root = Path(root)
+    try:
+        from engine.mft_scanner import enumerate_files_mft
+        drive = root.drive or root.anchor or str(root)[:2]
+        if drive:
+            files = enumerate_files_mft(drive, root, extensions)
+            if files:
+                yield from files
+                return
+    except Exception:
+        pass
+
+    yield from _safe_rglob_slow(root, extensions)
 
 
 def _compute_sha256(file_path):

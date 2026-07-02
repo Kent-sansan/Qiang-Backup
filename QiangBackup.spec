@@ -11,7 +11,7 @@ a = Analysis(
         'engine.config', 'engine.change_detector',
         'engine.backup_engine', 'engine.restore_engine',
         'engine.file_watcher', 'engine.backup_log',
-        'engine.reconciliation',
+        'engine.reconciliation', 'engine.mft_scanner',
         'ui.main_window', 'ui.tray_icon',
         'ui.restore_dialog', 'ui.orphan_dialog',
         'ui.change_files_dialog', 'ui.undo_dialog',

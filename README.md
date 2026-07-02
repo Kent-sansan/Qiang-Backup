@@ -115,11 +115,3 @@
 3. 密码必须和原来一致
 4. 添加源文件夹后即可继续使用，所有历史备份自动关联
 
----
-
-## 打包
-
-```
-pip install pyinstaller
-pyinstaller QiangBackup.spec
-```

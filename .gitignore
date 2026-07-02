@@ -7,3 +7,5 @@ __pycache__/
 *.spec.bak
 backup.log
 config.json
+engine/mft_scanner.py
+test_mft.py

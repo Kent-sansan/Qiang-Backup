@@ -1,10 +1,21 @@
 """File utility functions for context menu operations."""
 
+import os
 import subprocess
 from pathlib import Path
 
 from PySide6.QtWidgets import QMenu, QWidget
 from PySide6.QtGui import QAction
+
+
+def _long_path_str(p):
+    r"""Return path string with \\?\ prefix to bypass Windows 260-char MAX_PATH limit."""
+    s = str(p)
+    if s.startswith("\\\\?\\"):
+        return s
+    if s.startswith("\\\\"):
+        return "\\\\?\\UNC" + s[1:]
+    return "\\\\?\\" + s if len(s) >= 260 else s
 
 
 def open_folder(path):

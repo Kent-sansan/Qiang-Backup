@@ -1,5 +1,6 @@
 """Orphan backup detection and integrity checking."""
 
+import os
 import re
 import time
 from pathlib import Path
@@ -9,6 +10,7 @@ import py7zr
 
 from engine.backup_log import log_delete
 from engine.change_detector import _get_source_folder_name
+from utils.file_utils import _long_path_str
 
 
 def _parse_backup_filename(basename, extensions):
@@ -121,7 +123,7 @@ def check_backup_integrity(backup_root, extensions, password, progress_cb=None):
         ok = False
         for attempt in range(2):
             try:
-                with py7zr.SevenZipFile(archive_path, "r", password=password):
+                with py7zr.SevenZipFile(_long_path_str(archive_path), "r", password=password):
                     pass
                 ok = True
                 break
@@ -164,7 +166,7 @@ def delete_orphan_versions(orphan_items, backup_root):
     for item in orphan_items:
         for ver in item["versions"]:
             try:
-                ver["path"].unlink()
+                os.unlink(_long_path_str(ver["path"]))
                 deleted_dirs.add(ver["path"].parent)
                 deleted_paths.append(ver["path"])
                 deleted += 1
@@ -188,7 +190,7 @@ def delete_corrupted_backups(corrupted_items, backup_root):
     deleted_paths = []
     for item in corrupted_items:
         try:
-            item["path"].unlink()
+            os.unlink(_long_path_str(item["path"]))
             deleted_dirs.add(item["path"].parent)
             deleted_paths.append(item["path"])
             deleted += 1

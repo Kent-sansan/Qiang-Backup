@@ -1,10 +1,13 @@
 """Structured JSONL backup log -- append-only operation record."""
 
 import json
+import os
 import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+
+from utils.file_utils import _long_path_str
 
 
 def _get_log_path():
@@ -151,7 +154,7 @@ def delete_batch_files(batch_id):
     deleted = 0
     for filepath in files:
         try:
-            Path(filepath).unlink(missing_ok=True)
+            os.unlink(_long_path_str(filepath))
             deleted += 1
         except OSError:
             pass

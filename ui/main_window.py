@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QProgressDialog, QStatusBar, QSystemTrayIcon, QDialog,
     QApplication, QProgressBar,
 )
-from PySide6.QtCore import Qt, QThreadPool, Signal, QObject, QRunnable, QMutex
+from PySide6.QtCore import Qt, QThreadPool, Signal, QObject, QRunnable, QMutex, QTimer
 from PySide6.QtGui import QFont, QCloseEvent, QIcon
 
 from ui.tray_icon import TrayIcon
@@ -386,11 +386,20 @@ class MainWindow(QMainWindow):
         dlg_layout.addWidget(quit_btn)
 
         scan_signals = ScanSignals()
+        last_progress_time = [time.monotonic()]
+        startup_done = [False]
+        retry_attempts = [0]
+        worker_ref = [None]
 
         def on_count(n):
+            last_progress_time[0] = time.monotonic()
             count_label.setText(f"已扫描 {n} 个文件")
 
         def on_finished(results, locked_files, elapsed):
+            if startup_done[0]:
+                return
+            startup_done[0] = True
+            watchdog.stop()
             dlg.accept()
             self._on_startup_scan_done(results, locked_files, elapsed)
             self._finish_startup()
@@ -398,8 +407,44 @@ class MainWindow(QMainWindow):
         scan_signals.file_count.connect(on_count)
         scan_signals.finished.connect(on_finished)
 
-        worker = ScanWorker(valid, backup_root, extensions, scan_signals)
-        self._threadpool.start(worker)
+        def _start_worker():
+            w = ScanWorker(valid, backup_root, extensions, scan_signals)
+            worker_ref[0] = w
+            self._threadpool.start(w)
+
+        _start_worker()
+
+        watchdog = QTimer()
+        watchdog.setInterval(5000)
+
+        def check_stall():
+            if startup_done[0]:
+                watchdog.stop()
+                return
+            elapsed = time.monotonic() - last_progress_time[0]
+            if elapsed < 30:
+                return
+            if worker_ref[0] is not None:
+                worker_ref[0].cancel()
+            if retry_attempts[0] == 0:
+                retry_attempts[0] += 1
+                last_progress_time[0] = time.monotonic()
+                self._log("启动扫描超时，正在重试…")
+                _start_worker()
+            else:
+                watchdog.stop()
+                startup_done[0] = True
+                dlg.accept()
+                self._log("启动扫描未能完成，请手动运行备份")
+                QMessageBox.warning(
+                    dlg, "扫描超时",
+                    "自动文件扫描未能在预期时间内完成。\n请点击「手动备份」按钮完成扫描和备份。"
+                )
+                self._finish_startup()
+
+        watchdog.timeout.connect(check_stall)
+        watchdog.start()
+
         dlg.show()
 
     def _finish_startup(self):

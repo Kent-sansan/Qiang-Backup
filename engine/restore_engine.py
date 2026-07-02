@@ -7,6 +7,7 @@ import py7zr
 
 from engine.change_detector import safe_rglob, _compute_safe_stem, _get_relative_mirror_dir
 from engine.backup_log import log_restore, log_error
+from utils.file_utils import _long_path_str
 
 
 def find_restorable_files(source_folders, backup_root, extensions, progress_cb=None):
@@ -106,7 +107,7 @@ def restore_single_file(archive_path, source_path, password):
     target_dir = str(source_path.parent)
 
     try:
-        with py7zr.SevenZipFile(archive_path, "r", password=password) as szf:
+        with py7zr.SevenZipFile(_long_path_str(archive_path), "r", password=password) as szf:
             szf.extract(targets=[target_name], path=target_dir)
         log_restore(str(source_path), str(archive_path))
         return True

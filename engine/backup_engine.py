@@ -1,6 +1,7 @@
 """AES-256 encrypted 7z backup engine using py7zr with header encryption."""
 
 import hashlib
+import os
 import re
 import time
 from datetime import datetime
@@ -10,6 +11,7 @@ import py7zr
 
 from engine.change_detector import safe_rglob, _compute_safe_stem, _get_relative_mirror_dir
 from engine.backup_log import log_backup, log_error
+from utils.file_utils import _long_path_str
 
 
 def _compute_file_sha256(file_path):
@@ -42,7 +44,7 @@ def _cleanup_old_versions(archive_dir, stem, max_versions):
             break
         if oldest.exists():
             try:
-                oldest.unlink()
+                os.unlink(_long_path_str(oldest))
             except OSError:
                 pass
         versions.pop(0)
@@ -77,16 +79,16 @@ def backup_single_file(source_file, source_root, backup_root, password, max_vers
 
     for attempt in range(3):
         try:
-            archive_path.parent.mkdir(parents=True, exist_ok=True)
-            archive_path_tmp = archive_path.with_suffix('.tmp')
+            os.makedirs(_long_path_str(archive_path.parent), exist_ok=True)
+            archive_path_tmp = archive_path.with_suffix(".tmp")
 
             with py7zr.SevenZipFile(
-                archive_path_tmp, "w", password=password, header_encryption=True,
+                _long_path_str(archive_path_tmp), "w", password=password, header_encryption=True,
                 filters=[{"id": py7zr.FILTER_COPY}],
             ) as szf:
                 szf.write(str(source_file), source_file.name)
 
-            archive_path_tmp.rename(archive_path)
+            os.replace(_long_path_str(archive_path_tmp), _long_path_str(archive_path))
             _cleanup_old_versions(archive_path.parent, _compute_safe_stem(source_file.name), max_versions)
 
             try:
@@ -98,9 +100,9 @@ def backup_single_file(source_file, source_root, backup_root, password, max_vers
             return True, str(archive_path)
 
         except Exception as e:
-            if archive_path_tmp is not None and archive_path_tmp.exists():
+            if archive_path_tmp is not None:
                 try:
-                    archive_path_tmp.unlink()
+                    os.unlink(_long_path_str(archive_path_tmp))
                 except Exception:
                     pass
             if attempt < 2:
